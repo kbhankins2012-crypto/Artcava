@@ -7,7 +7,17 @@ A terminal-based audio visualizer that dynamically matches its colors to your cu
 Artcava is a Python-based audio visualizer inspired by CAVA. It captures system audio, analyzes its frequencies, and uses colors extracted from album artwork to create a dynamic terminal visualization.
 
 Designed to run inside the Kitty terminal.
+## Quick Install
 
+**Before you begin:** Kitty terminal must already be installed on your Linux system.
+
+Copy and paste the following command into your Kitty terminal:
+
+```bash
+bash -c 'command -v kitty >/dev/null 2>&1 || { echo "Error: Kitty must be installed before continuing."; exit 1; }; . /etc/os-release; case "$ID" in debian|ubuntu|linuxmint|pop|elementary|zorin) sudo apt update && sudo apt install -y git python3 python3-numpy python3-pil playerctl pulseaudio-utils;; arch|manjaro|endeavouros|omarchy) sudo pacman -Syu --needed --noconfirm git python python-numpy python-pillow playerctl libpulse;; fedora) sudo dnf install -y git python3 python3-numpy python3-pillow playerctl pulseaudio-utils;; opensuse*) sudo zypper --non-interactive install git python3 python3-numpy python3-Pillow playerctl pulseaudio-utils;; *) echo "Unsupported distribution: $ID"; exit 1;; esac && mkdir -p "$HOME/.local/share/artcava" "$HOME/.local/share/applications" && if [ -d "$HOME/.local/share/artcava/.git" ]; then git -C "$HOME/.local/share/artcava" pull --ff-only; else git clone https://github.com/kbhankins2012-crypto/Artcava.git "$HOME/.local/share/artcava"; fi && chmod +x "$HOME/.local/share/artcava/Artcava.py" && printf "[Desktop Entry]\nVersion=1.0\nType=Application\nName=Artcava\nComment=Terminal audio visualizer colored by album artwork\nExec=kitty --hold python3 \"%s\"\nIcon=audio-x-generic\nTerminal=false\nCategories=AudioVideo;Audio;\n" "$HOME/.local/share/artcava/Artcava.py" > "$HOME/.local/share/applications/artcava.desktop" && echo "Artcava installed successfully!"'
+```
+
+For manual installation, including installing Kitty, see [INSTALL.md](INSTALL.md).
 ## Features
 
 - Real-time audio visualization
