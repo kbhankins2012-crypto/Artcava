@@ -102,9 +102,7 @@ sudo pacman -S kitty python python-numpy python-pillow playerctl libpulse
 Clone the repository:
 
 ```bash
-git clone https://github.com/
-Change your avatar
-kbhankins2012-crypto/Artcava.git
+git clone https://github.com/kbhankins2012-crypto/Artcava.git
 ```
 
 Enter the project directory:
