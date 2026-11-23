@@ -44,7 +44,7 @@ The installer checks for Kitty, installs the required packages for supported dis
 
 Prefer installing everything yourself?
 
-See [INSTALL.md](https://github.com/kbhankins2012-crypto/Artcava/blob/main/INSTALL.md) for manual installation instructions.
+See [INSTALL.md](https://github.com/kbhankins2012-crypto/Artcava/blob/main/Installing%20Artcava.md) for manual installation instructions.
 
 ## Supported Distributions
 
