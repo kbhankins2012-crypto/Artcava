@@ -9,7 +9,8 @@ Designed for the **Kitty terminal**.
 
 ## Preview
 
-![Artcava running in the terminal](https://private-user-images.githubusercontent.com/273726653/716469025-9c269848-68be-4b81-ae8c-15dbf02da176.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJyYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tIiwia2V5Ijoia2V5MSIsImV4cCI6MTc5NTQ2ODMwNCwibmJmIjoxNzk1NDY4MDA0LCJwYXRoIjoiLzI3MzcyNjY1My83MTY0NjkwMjUtOWMyNjk4NDgtNjhiZS00YjgxLWFlOGMtMTVkYmYwMmRhMTc2LnBuZyJ9)
+<img width="1904" height="1003" alt="Screenshot From 2026-11-23 14-04-17" src="https://github.com/user-attachments/assets/0c04c57f-3c6d-4886-aadf-4cd545364146" />
+
 
 ## Features
 
