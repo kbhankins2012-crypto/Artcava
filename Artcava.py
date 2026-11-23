@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-artcava - a cava-style terminal visualizer whose bars take their colors
+Artcava - a cava-style terminal visualizer whose bars take their colors
 from the album art of whatever is currently playing.
 
 Audio : captured from your default output's monitor via `parec` (PulseAudio / PipeWire)
@@ -8,23 +8,26 @@ Art   : read from MPRIS via `playerctl` (Spotify, browsers playing YouTube / YT 
 
 Deps  : sudo apt install python3-numpy python3-pil playerctl pulseaudio-utils
 
-Usage : python3 artcava.py                  # follow whatever is playing
-        python3 artcava.py cover.jpg        # force a local image / URL (for testing)
-        python3 artcava.py --debug          # show palette swatches + art URL on the bottom line
+Usage : python3 Artcava.py                  # follow whatever is playing
+        python3 Artcava.py cover.jpg        # force a local image / URL (for testing)
+        python3 Artcava.py --debug          # show palette swatches + art URL on the bottom line
+
+Keys  : S = settings   Q = quit   (in settings: arrows or +/- to change, Esc/S/Q to close)
 """
 import colorsys
 import io
+import json
+import os
+import re
+import select
 import shutil
 import subprocess
 import sys
+import termios
 import threading
 import time
-import urllib.request
-import json
-import os
-import select
-import termios
 import tty
+import urllib.request
 
 import numpy as np
 from PIL import Image
@@ -44,6 +47,7 @@ BLOCKS = " ▁▂▃▄▅▆▇█"
 DEFAULT_PALETTE = [(80, 160, 255), (200, 90, 255), (255, 90, 160)]
 CONFIG_DIR = os.path.expanduser("~/.config/artcava")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.json")
+
 COLOR_PRESETS = {
     "Album art": None,
     "Ocean": [(35, 110, 255), (40, 220, 220), (190, 245, 255)],
@@ -56,36 +60,74 @@ COLOR_PRESETS = {
     "Blue": [(0, 45, 130), (25, 120, 255), (145, 205, 255)],
     "White": [(130, 145, 165), (210, 220, 235), (255, 255, 255)],
 }
-SETTINGS = {"color_mode": "Album art", "bar_width": BAR_W, "gap": GAP,
+
+DEFAULTS = {"color_mode": "Album art", "bar_width": BAR_W, "gap": GAP,
             "sensitivity": 1.0, "release_time": RELEASE_TIME, "beat_flash": BEAT_FLASH}
+SETTINGS = dict(DEFAULTS)
+
+# (key, low, high, type) used to clamp whatever is in the settings file
+LIMITS = [("bar_width", 1, 4, int), ("gap", 0, 4, int), ("sensitivity", 0.5, 2.5, float),
+          ("release_time", 0.06, 0.5, float), ("beat_flash", 0.0, 1.0, float)]
 
 
 def load_settings():
+    """Load saved settings; any missing or corrupt value falls back to its default."""
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             saved = json.load(f)
-        for key in SETTINGS:
-            if key in saved:
-                SETTINGS[key] = saved[key]
-    except (OSError, ValueError, TypeError):
-        pass
-    SETTINGS["color_mode"] = SETTINGS["color_mode"] if SETTINGS["color_mode"] in COLOR_PRESETS else "Album art"
-    SETTINGS["bar_width"] = max(1, min(4, int(SETTINGS["bar_width"])))
-    SETTINGS["gap"] = max(0, min(4, int(SETTINGS["gap"])))
-    SETTINGS["sensitivity"] = max(0.5, min(2.5, float(SETTINGS["sensitivity"])))
-    SETTINGS["release_time"] = max(0.06, min(0.5, float(SETTINGS["release_time"])))
-    SETTINGS["beat_flash"] = max(0.0, min(1.0, float(SETTINGS["beat_flash"])))
+        if not isinstance(saved, dict):
+            saved = {}
+    except (OSError, ValueError):
+        saved = {}
+    for key in DEFAULTS:
+        if key in saved:
+            SETTINGS[key] = saved[key]
+    if not isinstance(SETTINGS["color_mode"], str) or SETTINGS["color_mode"] not in COLOR_PRESETS:
+        SETTINGS["color_mode"] = DEFAULTS["color_mode"]
+    for key, lo, hi, cast in LIMITS:
+        try:
+            value = cast(SETTINGS[key])
+            if value != value:                       # NaN
+                raise ValueError
+            SETTINGS[key] = max(lo, min(hi, value))
+        except (TypeError, ValueError, OverflowError):
+            SETTINGS[key] = DEFAULTS[key]
 
 
 def save_settings():
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(SETTINGS, f, indent=2)
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(SETTINGS, f, indent=2)
+    except OSError:
+        pass                                          # read-only home etc.: just don't save
 
 
 def active_palette(album_palette):
     preset = COLOR_PRESETS[SETTINGS["color_mode"]]
     return album_palette if preset is None else preset
+
+
+# ---------------------------------------------------------------- keyboard --
+KEY_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z~]|\x1bO[A-Za-z]|\x1b|.", re.S)
+UP, DOWN = ("\x1b[A", "\x1bOA"), ("\x1b[B", "\x1bOB")
+RIGHT, LEFT = ("\x1b[C", "\x1bOC"), ("\x1b[D", "\x1bOD")
+
+
+def read_keys(timeout=None):
+    """Read raw bytes straight from the terminal and split them into key tokens.
+
+    Reading with os.read (not sys.stdin.read) avoids Python's input buffering, which
+    used to swallow the rest of an arrow-key sequence and make arrows look like Esc.
+    timeout=None blocks, timeout=0 polls. Raises EOFError if stdin is closed.
+    """
+    fd = sys.stdin.fileno()
+    if timeout is not None and not select.select([fd], [], [], timeout)[0]:
+        return []
+    data = os.read(fd, 64)
+    if not data:
+        raise EOFError
+    return KEY_RE.findall(data.decode("utf-8", "ignore"))
 
 
 def settings_menu():
@@ -94,10 +136,12 @@ def settings_menu():
     selected = 0
     color_names = list(COLOR_PRESETS)
     help_text = "↑/↓ select   ←/→ change   Enter change   S/Esc close"
+
     def value_for(i):
         return [SETTINGS["color_mode"], str(SETTINGS["bar_width"]), str(SETTINGS["gap"]),
                 f'{SETTINGS["sensitivity"]:.1f}x', f'{SETTINGS["release_time"]:.2f}s',
                 f'{SETTINGS["beat_flash"]:.2f}'][i]
+
     def change(direction):
         if selected == 0:
             idx = color_names.index(SETTINGS["color_mode"])
@@ -112,38 +156,32 @@ def settings_menu():
             SETTINGS["release_time"] = round(max(0.06, min(0.5, SETTINGS["release_time"] + direction * 0.02)), 2)
         elif selected == 5:
             SETTINGS["beat_flash"] = round(max(0.0, min(1.0, SETTINGS["beat_flash"] + direction * 0.05)), 2)
+
     while True:
-        sys.stdout.write("\x1b[2J\x1b[H\x1b[1;36m  A R T C A V A   /   S E T T I N G S\x1b[0m\n\n")
-        sys.stdout.write("  Navigate with arrow keys. Changes apply immediately.\n\n")
+        out = ["\x1b[2J\x1b[H\x1b[1;36m A R T C A V A / S E T T I N G S\x1b[0m\n\n",
+               " Navigate with arrow keys. Changes apply immediately.\n\n"]
         for i, label in enumerate(rows):
             marker = "\x1b[1;36m ❯ " if i == selected else "   "
             end = "\x1b[0m" if i == selected else ""
-            sys.stdout.write(f"{marker}{label:<18} {value_for(i):>12}{end}\n")
-        sys.stdout.write("\n  "+help_text+"\n")
+            out.append(f"{marker}{label:<18} {value_for(i):>12}{end}\n")
+        out.append("\n " + help_text + "\n")
+        sys.stdout.write("".join(out))
         sys.stdout.flush()
-        ch = sys.stdin.read(1)
-        if ch == "\x1b":
-            # Read the rest of an arrow-key escape sequence if present.
-            if select.select([sys.stdin], [], [], 0.025)[0]:
-                seq = sys.stdin.read(1)
-                if seq == "[" and select.select([sys.stdin], [], [], 0.025)[0]:
-                    arrow = sys.stdin.read(1)
-                    if arrow == "A": selected = (selected - 1) % len(rows)
-                    elif arrow == "B": selected = (selected + 1) % len(rows)
-                    elif arrow == "C": change(1)
-                    elif arrow == "D": change(-1)
-            else:
-                save_settings(); return
-        elif ch in "qQ":
-            save_settings(); return
-        elif ch in "sS":
-            save_settings(); return
-        elif ch in "\r\n":
-            change(1)
-        elif ch in "+=":
-            change(1)
-        elif ch == "-":
-            change(-1)
+
+        for key in read_keys():                      # blocks until a key arrives
+            if key in UP:
+                selected = (selected - 1) % len(rows)
+            elif key in DOWN:
+                selected = (selected + 1) % len(rows)
+            elif key in RIGHT or key in ("\r", "\n", "+", "="):
+                change(1)
+            elif key in LEFT or key == "-":
+                change(-1)
+            elif key in ("\x1b", "s", "S", "q", "Q"):
+                save_settings()
+                return
+
+
 MEDIANCUT = getattr(getattr(Image, "Quantize", Image), "MEDIANCUT")
 
 
@@ -326,7 +364,7 @@ class Analyzer:
         raw = np.empty(self.nbars)
         for i, (lo, hi) in enumerate(self.slices):
             if hi - lo >= 2:
-                raw[i] = mag[lo:hi].mean()                       # wide bars: average
+                raw[i] = mag[lo:hi].mean()                             # wide bars: average
             else:
                 raw[i] = np.interp(self.centers[i], self.freqs, mag)   # narrow (bass) bars: interpolate
         raw *= self.tilt * SETTINGS["sensitivity"]
@@ -342,9 +380,7 @@ class Analyzer:
                 sm[:-d] = np.maximum(sm[:-d], v[d:] * f)
         v = np.clip(sm, 0.0, 1.0)
 
-        # Smooth, frame-rate-independent attack and release.
-        # Exponential release avoids the abrupt, uneven drop that can happen
-        # when the terminal misses a frame.
+        # frame-rate-independent attack and release
         attack = 1.0 - np.exp(-dt / ATTACK_TIME)
         release = 1.0 - np.exp(-dt / SETTINGS["release_time"])
         rising = v > self.vals
@@ -387,6 +423,10 @@ def status_line(watcher):
 
 
 def main():
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        sys.exit("Artcava needs a real terminal (not an IDE console). "
+                 "Open a terminal and run: python3 Artcava.py")
+
     load_settings()
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     debug = "--debug" in sys.argv
@@ -406,24 +446,28 @@ def main():
     current = None
     last = time.perf_counter()
     next_t = last
+    quit_requested = False
 
     sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J")
     try:
-        while True:
+        while not quit_requested:
             now = time.perf_counter()
             dt = min(0.05, max(1e-3, now - last))
             last = now
 
-            # Press S at any time to open the settings panel.
-            if select.select([sys.stdin], [], [], 0)[0]:
-                key = sys.stdin.read(1)
-                if key in "sS":
+            # S opens settings, Q quits (checked every frame without blocking)
+            for key in read_keys(0):
+                if key in ("s", "S"):
                     settings_menu()
-                    size = None  # force a clean redraw after leaving settings
-                    next_t = time.perf_counter()
-                    continue
-                elif key in "qQ":
+                    size = None                       # force a clean redraw after leaving settings
+                    next_t = last = time.perf_counter()
                     break
+                if key in ("q", "Q"):
+                    quit_requested = True
+                    break
+            if quit_requested:
+                break
+
             cols, lines = shutil.get_terminal_size()
             if (cols, lines) != size:
                 size = (cols, lines)
@@ -442,13 +486,13 @@ def main():
                                     status_line(watcher) if debug else ""))
             sys.stdout.flush()
 
-            next_t += 1 / FPS                    # fixed schedule = even frame spacing
+            next_t += 1 / FPS                         # fixed schedule = even frame spacing
             spare = next_t - time.perf_counter()
             if spare > 0:
                 time.sleep(spare)
             else:
-                next_t = time.perf_counter()     # fell behind: resync instead of bursting
-    except KeyboardInterrupt:
+                next_t = time.perf_counter()          # fell behind: resync instead of bursting
+    except (KeyboardInterrupt, EOFError):
         pass
     finally:
         reader.proc.terminate()
