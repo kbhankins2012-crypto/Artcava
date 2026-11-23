@@ -11,6 +11,7 @@ Designed for the **Kitty terminal**.
 
 <img width="1904" height="1003" alt="Screenshot From 2026-11-23 14-04-17" src="https://github.com/user-attachments/assets/0c04c57f-3c6d-4886-aadf-4cd545364146" />
 
+**Disclaimer:** Not every album cover is gonna turn into colors perfectly. Some covers might look a little different in the visualizer, and that's completely normal. Artcava does its best to match the colors, but the results won't always be exact.
 
 ## Features
 
