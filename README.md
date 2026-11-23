@@ -27,25 +27,46 @@ Designed for the **Kitty terminal**.
 
 ## Quick Install
 
-**Requirements:**
-
-- Linux
-- Kitty terminal installed
-- An MPRIS-compatible music player
-
 Copy and paste this command into your terminal:
 
 ```bash
-bash -c 'command -v kitty >/dev/null 2>&1 || { echo "Error: Kitty must be installed before continuing."; exit 1; }; . /etc/os-release; case "$ID" in debian|ubuntu|linuxmint|pop|elementary|zorin) sudo apt update && sudo apt install -y git python3 python3-numpy python3-pil playerctl pulseaudio-utils;; arch|manjaro|endeavouros|omarchy) sudo pacman -Syu --needed --noconfirm git python python-numpy python-pillow playerctl libpulse;; fedora) sudo dnf install -y git python3 python3-numpy python3-pillow playerctl pulseaudio-utils;; opensuse*) sudo zypper --non-interactive install git python3 python3-numpy python3-Pillow playerctl pulseaudio-utils;; *) echo "Unsupported distribution: $ID"; exit 1;; esac && mkdir -p "$HOME/.local/share/artcava" "$HOME/.local/share/applications" && if [ -d "$HOME/.local/share/artcava/.git" ]; then git -C "$HOME/.local/share/artcava" pull --ff-only; else git clone https://github.com/kbhankins2012-crypto/Artcava.git "$HOME/.local/share/artcava"; fi && chmod +x "$HOME/.local/share/artcava/Artcava.py" && printf "[Desktop Entry]\nVersion=1.0\nType=Application\nName=Artcava\nComment=Terminal audio visualizer colored by album artwork\nExec=kitty --hold python3 \"%s\"\nIcon=audio-x-generic\nTerminal=false\nCategories=AudioVideo;Audio;\n" "$HOME/.local/share/artcava/Artcava.py" > "$HOME/.local/share/applications/artcava.desktop" && echo "Artcava installed successfully!"'
+bash -c '
+set -e
+D="$HOME/.local/share/artcava"
+. /etc/os-release
+case " $ID $ID_LIKE " in
+  *" debian "*|*" ubuntu "*)
+    sudo apt update && sudo apt install -y git kitty python3 python3-numpy python3-pil playerctl pulseaudio-utils ;;
+  *" arch "*)
+    sudo pacman -Syu --needed --noconfirm git kitty python python-numpy python-pillow playerctl libpulse ;;
+  *" fedora "*|*" rhel "*)
+    sudo dnf install -y git kitty python3 python3-numpy python3-pillow playerctl pulseaudio-utils ;;
+  *" suse "*|*" opensuse "*)
+    sudo zypper --non-interactive install git kitty python3 python3-numpy python3-Pillow playerctl pulseaudio-utils ;;
+  *)
+    echo "Unsupported distribution: $ID"; exit 1 ;;
+esac
+if [ -d "$D/.git" ]; then
+  git -C "$D" fetch --depth 1 origin main && git -C "$D" reset --hard origin/main
+else
+  rm -rf "$D" && git clone --depth 1 https://github.com/kbhankins2012-crypto/Artcava.git "$D"
+fi
+chmod +x "$D/Artcava.py"
+mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
+ln -sf "$D/Artcava.py" "$HOME/.local/bin/artcava"
+printf "[Desktop Entry]\nVersion=1.0\nType=Application\nName=Artcava\nComment=Terminal audio visualizer colored by album artwork\nExec=kitty --hold python3 \"%s\"\nIcon=audio-x-generic\nTerminal=false\nCategories=AudioVideo;Audio;\n" "$D/Artcava.py" > "$HOME/.local/share/applications/artcava.desktop"
+echo "Artcava is installed and up to date! Open it from your app menu, or type: artcava"
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo "Note: log out and back in (or add ~/.local/bin to your PATH) to use the artcava command." ;; esac
+'
 ```
 
-The installer checks for Kitty, installs the required packages for supported distributions, downloads Artcava, and creates a desktop application launcher.
+The installer automatically detects your Linux distribution, installs the required dependencies (including Kitty), downloads or updates Artcava, creates a terminal command, and adds a desktop application launcher.
 
 ## Manual Installation
 
 Prefer installing everything yourself?
 
-See [INSTALL.md](https://github.com/kbhankins2012-crypto/Artcava/blob/main/Installing%20Artcava.md) for manual installation instructions.
+See [Installing Artcava](https://github.com/kbhankins2012-crypto/Artcava/blob/main/Installing%20Artcava.md) for manual installation instructions.
 
 ## Supported Distributions
 
@@ -78,7 +99,11 @@ Other Linux distributions may work if their dependencies are available.
 
 ## Running Artcava
 
-After installation, you can launch Artcava from your desktop application menu.
+After installation, you can launch Artcava from your desktop application menu or run:
+
+```bash
+artcava
+```
 
 To run it manually:
 
