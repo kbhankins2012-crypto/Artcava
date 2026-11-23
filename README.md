@@ -6,6 +6,9 @@ Artcava is a Python-based terminal audio visualizer inspired by CAVA. It capture
 
 Designed for the **Kitty terminal**.
 
+## Preview
+<img width="1904" height="1003" alt="Screenshot From 2026-11-23 14-04-17" src="https://github.com/user-attachments/assets/9c269848-68be-4b81-ae8c-15dbf02da176" />
+
 ## Features
 
 - **Real-time audio visualization** — Displays audio frequencies as animated bars.
