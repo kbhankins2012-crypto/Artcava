@@ -297,28 +297,45 @@ class UpdateChecker(threading.Thread):
             return self.status, self.available, self.remote_hash, self.error
 
     def check_now(self):
-        """Fetch the public source and compare its SHA-256 with this file."""
+        """Fetch a fresh GitHub copy and verify mismatches before notifying."""
         with self._check_lock:
             try:
-                request = urllib.request.Request(
-                    UPDATE_RAW_URL,
-                    headers={
-                        "User-Agent": UPDATE_USER_AGENT,
-                        "Cache-Control": "no-cache",
-                    },
-                )
-                with urllib.request.urlopen(request, timeout=6) as response:
-                    remote_source = response.read(2 * 1024 * 1024 + 1)
+                def fetch_remote_source():
+                    # A unique query string helps avoid stale CDN/proxy cache entries.
+                    fresh_url = f"{UPDATE_RAW_URL}?artcava_check={time.time_ns()}"
+                    request = urllib.request.Request(
+                        fresh_url,
+                        headers={
+                            "User-Agent": UPDATE_USER_AGENT,
+                            "Cache-Control": "no-cache, no-store, max-age=0",
+                            "Pragma": "no-cache",
+                        },
+                    )
+                    with urllib.request.urlopen(request, timeout=6) as response:
+                        source = response.read(2 * 1024 * 1024 + 1)
 
-                if len(remote_source) > 2 * 1024 * 1024:
-                    raise ValueError("The GitHub source file is unexpectedly large")
+                    if len(source) > 2 * 1024 * 1024:
+                        raise ValueError(
+                            "The GitHub source file is unexpectedly large"
+                        )
+                    return source
+
+                remote_source = fetch_remote_source()
 
                 with open(self.local_path, "rb") as source_file:
                     local_source = source_file.read()
 
-                remote_hash = hashlib.sha256(remote_source).hexdigest()
                 local_hash = hashlib.sha256(local_source).hexdigest()
+                remote_hash = hashlib.sha256(remote_source).hexdigest()
                 available = remote_hash != local_hash
+
+                # If a mismatch appears, fetch once more before showing a notice.
+                # The second fresh response is the one used for the final decision.
+                if available:
+                    time.sleep(0.3)
+                    verified_source = fetch_remote_source()
+                    remote_hash = hashlib.sha256(verified_source).hexdigest()
+                    available = remote_hash != local_hash
 
                 with self._state_lock:
                     self.remote_hash = remote_hash
