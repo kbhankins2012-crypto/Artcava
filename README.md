@@ -187,6 +187,7 @@ kitty --hold python3 Artcava.py
 Artcava includes several color presets:
 
 - Album Art
+- Dreamy
 - Ocean
 - Fire
 - Forest
