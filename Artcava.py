@@ -12,7 +12,7 @@ Usage : python3 Artcava.py                  # follow whatever is playing
         python3 Artcava.py cover.jpg        # force a local image / URL (for testing)
         python3 Artcava.py --debug          # show palette swatches + art URL on the bottom line
 
-Keys  : S = settings   Q = quit   L = lyrics on/off   [ ] = nudge lyric timing
+Keys  : S = settings   Q = quit   L = lyrics on/off   T = song title on/off   [ ] = nudge lyric timing
         (in settings: arrows or +/- to change, Esc/S/Q to close)
 """
 import bisect
@@ -68,7 +68,7 @@ COLOR_PRESETS = {
 
 DEFAULTS = {"color_mode": "Album art", "bar_width": BAR_W, "gap": GAP,
             "sensitivity": 1.0, "release_time": RELEASE_TIME, "beat_flash": BEAT_FLASH,
-            "lyrics": True, "lyrics_offset": 0.0}
+            "lyrics": True, "lyrics_offset": 0.0, "show_title": True}
 SETTINGS = dict(DEFAULTS)
 
 # (key, low, high, type) used to clamp whatever is in the settings file
@@ -91,8 +91,9 @@ def load_settings():
             SETTINGS[key] = saved[key]
     if not isinstance(SETTINGS["color_mode"], str) or SETTINGS["color_mode"] not in COLOR_PRESETS:
         SETTINGS["color_mode"] = DEFAULTS["color_mode"]
-    if not isinstance(SETTINGS["lyrics"], bool):
-        SETTINGS["lyrics"] = DEFAULTS["lyrics"]
+    for flag in ("lyrics", "show_title"):
+        if not isinstance(SETTINGS[flag], bool):
+            SETTINGS[flag] = DEFAULTS[flag]
     for key, lo, hi, cast in LIMITS:
         try:
             value = cast(SETTINGS[key])
@@ -142,7 +143,7 @@ def read_keys(timeout=None):
 def settings_menu():
     """Small btop-inspired keyboard settings panel; called from the visualizer."""
     rows = ["Color theme", "Bar width", "Bar spacing", "Sensitivity", "Bar smoothing", "Beat flash",
-            "Lyrics", "Lyrics timing"]
+            "Lyrics", "Lyrics timing", "Song title"]
     selected = 0
     color_names = list(COLOR_PRESETS)
     help_text = "↑/↓ select   ←/→ change   Enter change   S/Esc close"
@@ -151,7 +152,8 @@ def settings_menu():
         return [SETTINGS["color_mode"], str(SETTINGS["bar_width"]), str(SETTINGS["gap"]),
                 f'{SETTINGS["sensitivity"]:.1f}x', f'{SETTINGS["release_time"]:.2f}s',
                 f'{SETTINGS["beat_flash"]:.2f}',
-                "On" if SETTINGS["lyrics"] else "Off", f'{SETTINGS["lyrics_offset"]:+.2f}s'][i]
+                "On" if SETTINGS["lyrics"] else "Off", f'{SETTINGS["lyrics_offset"]:+.2f}s',
+                "On" if SETTINGS["show_title"] else "Off"][i]
 
     def change(direction):
         if selected == 0:
@@ -171,6 +173,8 @@ def settings_menu():
             SETTINGS["lyrics"] = not SETTINGS["lyrics"]
         elif selected == 7:
             SETTINGS["lyrics_offset"] = round(max(-5.0, min(5.0, SETTINGS["lyrics_offset"] + direction * 0.25)), 2)
+        elif selected == 8:
+            SETTINGS["show_title"] = not SETTINGS["show_title"]
 
     while True:
         out = ["\x1b[2J\x1b[H\x1b[1;36m A R T C A V A / S E T T I N G S\x1b[0m\n\n",
@@ -417,6 +421,7 @@ LRCLIB = "https://lrclib.net/api"
 USER_AGENT = "Artcava (https://github.com/kbhankins2012-crypto/Artcava)"
 LYRIC_CACHE = os.path.expanduser("~/.cache/artcava/lyrics")
 LYRIC_ROWS = 4                     # blank spacer + previous / current / next line
+HEADER_ROWS = 2                    # song title line + blank spacer
 SEP = "\x1f"
 LRC_TAG = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
 LRC_WORD = re.compile(r"<\d+:\d+(?:\.\d+)?>")
@@ -519,6 +524,7 @@ class LyricsWatcher(threading.Thread):
         super().__init__(daemon=True)
         self.data = ("idle", [], [])          # (state, times, lines); state: idle/loading/ok/none
         self.key = None
+        self.track = None                     # (title, album, artist) of the current song
         self.playing = False
         self.anchor_pos = 0.0
         self.anchor_t = time.monotonic()
@@ -563,14 +569,20 @@ class LyricsWatcher(threading.Thread):
             return None
 
     def poll(self):
-        if not SETTINGS["lyrics"]:
+        if not (SETTINGS["lyrics"] or SETTINGS["show_title"]):
             self.key = None
             self.data = ("idle", [], [])
             return
         info = self.now_playing()
         if info is None:
+            self.track = None
             return
         player, status, artist, title, album, length = info
+        self.track = (title, album, re.sub(r"\s*-\s*Topic$", "", artist).strip())
+        if not SETTINGS["lyrics"]:                 # title only: no network, no position needed
+            self.key = None
+            self.data = ("idle", [], [])
+            return
         pos = self.read_position(player)
         if pos is not None:
             self.anchor_pos, self.anchor_t = pos, time.monotonic()
@@ -620,6 +632,35 @@ def fit(s, width):
     return out + "…"
 
 
+def header_block(watcher, cols, accent):
+    """HEADER_ROWS terminal lines: "Title \u2014 Album \u2014 Artist", centered at the top."""
+    blank = "\x1b[K"
+    track = watcher.track
+    if not track:
+        return [blank] * HEADER_ROWS
+    title, album, artist = track
+    title = TITLE_NOISE.sub("", title).strip() or title       # drop "(Official Video)" and friends
+    album = re.sub(r"\s*-\s*(single|ep)$", "", album, flags=re.I).strip()
+    if album.lower() == title.lower():                       # singles: don't repeat the title
+        album = ""
+    r, g, b = (int(c) for c in accent)
+    bold = f"\x1b[1;38;2;{r};{g};{b}m"
+    dim = "\x1b[38;2;150;150;165m"
+    width = max(1, cols - 2)
+
+    # Show as much as fits: title+album+artist, then title+artist, then just the title.
+    for rest in ([album, artist], [artist], []):
+        rest = [x for x in rest if x]
+        total = text_width(title) + sum(3 + text_width(x) for x in rest)
+        if total <= width:
+            pad = " " * ((cols - total) // 2)
+            line = pad + bold + title + dim + "".join(" \u2014 " + x for x in rest) + "\x1b[0m\x1b[K"
+            return [line] + [blank] * (HEADER_ROWS - 1)
+    title = fit(title, width)                                # not even the title fits whole
+    line = f"{' ' * ((cols - text_width(title)) // 2)}{bold}{title}\x1b[0m\x1b[K"
+    return [line] + [blank] * (HEADER_ROWS - 1)
+
+
 def lyric_block(watcher, cols, accent):
     """LYRIC_ROWS terminal lines: a spacer, then previous / current / next lyric."""
     state, times, lines = watcher.data
@@ -646,13 +687,13 @@ def lyric_block(watcher, cols, accent):
 
 
 # ------------------------------------------------------------------ render --
-def render(vals, colors, rows, pulse, status="", extra=None):
+def render(vals, colors, rows, pulse, status="", extra=None, header=None):
     flash = colors + (255 - colors) * (pulse * SETTINGS["beat_flash"])
     q = (np.clip(flash, 0, 255).astype(int) >> 3) << 3
     prefixes = [f"\x1b[38;2;{r};{g};{b}m" for r, g, b in q]
     heights = vals * rows * 8
     gap = " " * SETTINGS["gap"]
-    lines = []
+    lines = list(header) if header else []
     for row in range(rows):
         base = (rows - 1 - row) * 8
         parts, last = [], None
@@ -724,6 +765,10 @@ def main():
                     SETTINGS["lyrics"] = not SETTINGS["lyrics"]
                     save_settings()
                     sys.stdout.write("\x1b[2J")
+                elif key in ("t", "T"):
+                    SETTINGS["show_title"] = not SETTINGS["show_title"]
+                    save_settings()
+                    sys.stdout.write("\x1b[2J")
                 elif key in ("[", "]"):
                     step = -0.25 if key == "[" else 0.25
                     SETTINGS["lyrics_offset"] = round(max(-5.0, min(5.0, SETTINGS["lyrics_offset"] + step)), 2)
@@ -744,15 +789,17 @@ def main():
             current += (target - current) * color_ease
 
             vals = analyzer.update(reader.snapshot(), dt)
-            show_lyrics = SETTINGS["lyrics"] and lines >= 12
-            rows = max(1, lines - 1 - (LYRIC_ROWS if show_lyrics else 0) - (1 if debug else 0))
-            extra = None
-            if show_lyrics:
-                mid = current[len(current) // 2]
-                accent = mid + (255 - mid) * 0.35            # a lighter shade of the album color
-                extra = lyric_block(lyrics, cols, accent)
+            roomy = lines >= 12                              # hide title/lyrics on tiny terminals
+            show_lyrics = SETTINGS["lyrics"] and roomy
+            show_title = SETTINGS["show_title"] and roomy
+            rows = max(1, lines - 1 - (LYRIC_ROWS if show_lyrics else 0)
+                       - (HEADER_ROWS if show_title else 0) - (1 if debug else 0))
+            mid = current[len(current) // 2]
+            accent = mid + (255 - mid) * 0.35                # a lighter shade of the album color
+            header = header_block(lyrics, cols, accent) if show_title else None
+            extra = lyric_block(lyrics, cols, accent) if show_lyrics else None
             sys.stdout.write(render(vals, current, rows, analyzer.pulse,
-                                    status_line(watcher) if debug else "", extra))
+                                    status_line(watcher) if debug else "", extra, header))
             sys.stdout.flush()
 
             next_t += 1 / FPS                         # fixed schedule = even frame spacing
