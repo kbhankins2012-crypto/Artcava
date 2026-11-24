@@ -37,6 +37,7 @@ import tty
 import unicodedata
 import urllib.parse
 import urllib.request
+import webbrowser
 
 import numpy as np
 from PIL import Image
@@ -265,8 +266,178 @@ def read_keys(timeout=None):
     return KEY_RE.findall(data.decode("utf-8", "ignore"))
 
 
+# --------------------------------------------------------------- updates --
+UPDATE_RAW_URL = (
+    "https://raw.githubusercontent.com/"
+    "kbhankins2012-crypto/Artcava/main/Artcava.py"
+)
+UPDATE_PAGE_URL = (
+    "https://github.com/kbhankins2012-crypto/Artcava/blob/main/Artcava.py"
+)
+UPDATE_USER_AGENT = "Artcava-Updater/1.0"
+
+
+class UpdateChecker(threading.Thread):
+    """Compare this installed script with Artcava.py on GitHub's main branch."""
+
+    def __init__(self, local_path):
+        super().__init__(daemon=True)
+        self.local_path = os.path.realpath(local_path)
+        self.status = "checking"
+        self.available = False
+        self.remote_hash = ""
+        self.error = ""
+        self._state_lock = threading.Lock()
+        self._check_lock = threading.Lock()
+
+    def snapshot(self):
+        with self._state_lock:
+            return self.status, self.available, self.remote_hash, self.error
+
+    def check_now(self):
+        """Fetch the public source and compare its SHA-256 with this file."""
+        with self._check_lock:
+            try:
+                request = urllib.request.Request(
+                    UPDATE_RAW_URL,
+                    headers={
+                        "User-Agent": UPDATE_USER_AGENT,
+                        "Cache-Control": "no-cache",
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=6) as response:
+                    remote_source = response.read(2 * 1024 * 1024 + 1)
+
+                if len(remote_source) > 2 * 1024 * 1024:
+                    raise ValueError("The GitHub source file is unexpectedly large")
+
+                with open(self.local_path, "rb") as source_file:
+                    local_source = source_file.read()
+
+                remote_hash = hashlib.sha256(remote_source).hexdigest()
+                local_hash = hashlib.sha256(local_source).hexdigest()
+                available = remote_hash != local_hash
+
+                with self._state_lock:
+                    self.remote_hash = remote_hash
+                    self.available = available
+                    self.status = "available" if available else "up_to_date"
+                    self.error = ""
+            except Exception as exc:
+                with self._state_lock:
+                    self.available = False
+                    self.status = "error"
+                    self.error = str(exc)
+
+            return self.snapshot()[0]
+
+    def run(self):
+        self.check_now()
+
+
+def copy_to_clipboard(text):
+    """Copy text using whichever common Linux clipboard tool is installed."""
+    commands = (
+        # Kitty's clipboard kitten works without a separate clipboard utility.
+        ["kitten", "clipboard"],
+        ["wl-copy"],
+        ["xclip", "-selection", "clipboard"],
+        ["xsel", "--clipboard", "--input"],
+    )
+    for command in commands:
+        if not shutil.which(command[0]):
+            continue
+        try:
+            result = subprocess.run(
+                command,
+                input=text,
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            if result.returncode == 0:
+                return True
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return False
+
+
+def open_update_page():
+    """Copy the GitHub source link and open it in the default browser."""
+    copied = copy_to_clipboard(UPDATE_PAGE_URL)
+    try:
+        opened = webbrowser.open(UPDATE_PAGE_URL, new=2)
+    except Exception:
+        opened = False
+
+    if copied and opened:
+        return "GitHub opened and the link was copied to your clipboard."
+    if copied:
+        return "Link copied. Open it in your browser to view the update."
+    if opened:
+        return "GitHub opened. Clipboard tools (wl-copy, xclip, or xsel) were not found."
+    return "Could not open or copy automatically. Link: " + UPDATE_PAGE_URL
+
+
+def update_notice_layout(cols, lines):
+    """Return the terminal position and text for the small update banner."""
+    title = "Artcava update available"
+    actions = "[U] Update now (copy + open)   [X] Update later"
+    width = max(len(title), len(actions)) + 4
+    if cols < width + 2 or lines < 6:
+        return None
+    row = lines - 3
+    col = cols - width + 1
+    top = "┌" + "─" * (width - 2) + "┐"
+    middle = "│ " + actions.ljust(width - 4) + " │"
+    bottom = "└" + "─" * (width - 2) + "┘"
+    return row, col, width, actions, (top, middle, bottom)
+
+
+def update_notice_overlay(cols, lines):
+    """Draw a right-aligned, three-line update notice in the terminal corner."""
+    layout = update_notice_layout(cols, lines)
+    if not layout:
+        return ""
+    row, col, _width, _actions, panel = layout
+    style = "\x1b[1;38;2;105;190;255m"
+    body = "\x1b[38;2;225;230;240m"
+    bg = "\x1b[48;2;24;27;38m"
+    reset = "\x1b[0m"
+    return "".join(
+        f"\x1b[{row + i};{col}H{bg}{style if i != 1 else body}{line}{reset}"
+        for i, line in enumerate(panel)
+    )
+
+
+def update_notice_mouse_action(key, cols, lines):
+    """Recognize clicks on Update now or Update later in the update banner."""
+    match = re.fullmatch(r"\x1b\[<(\d+);(\d+);(\d+)([mM])", key)
+    if not match:
+        return None
+    button, x, y, event = match.groups()
+    if int(button) != 0 or event != "M":
+        return None
+
+    layout = update_notice_layout(cols, lines)
+    if not layout:
+        return None
+    row, col, _width, actions, _panel = layout
+    if int(y) != row + 1:
+        return None
+
+    inner_x = int(x) - (col + 2)
+    later_at = actions.index("[X]")
+    if 0 <= inner_x < later_at:
+        return "update"
+    if later_at <= inner_x < len(actions):
+        return "later"
+    return None
+
+
 # --------------------------------------------------------------- menu --
-def settings_menu():
+def settings_menu(update_checker=None, update_ui_state=None):
     """Display and edit Artcava's settings."""
     rows = [
         "Color theme",
@@ -280,11 +451,13 @@ def settings_menu():
         "Lyrics timing",
         "Song title",
         "Opacity",
+        "Check for updates",
     ]
 
     selected = 0
     color_names = list(COLOR_PRESETS)
-    help_text = "↑/↓ select   ←/→ change   Enter change   S/Esc close"
+    help_text = "↑/↓ select   ←/→ change   Enter select/check   S/Esc close"
+    update_prompt = False
 
     def value_for(i):
         return [
@@ -299,6 +472,7 @@ def settings_menu():
             f'{SETTINGS["lyrics_offset"]:+.2f}s',
             "On" if SETTINGS["show_title"] else "Off",
             f'{SETTINGS["opacity"]:.2f}',
+            "Press Enter",
         ][i]
 
     def change(direction):
@@ -313,13 +487,9 @@ def settings_menu():
                 (idx + direction) % len(VISUALIZATIONS)
             ]
         elif selected == 2:
-            SETTINGS["bar_width"] = max(
-                1, min(4, SETTINGS["bar_width"] + direction)
-            )
+            SETTINGS["bar_width"] = max(1, min(4, SETTINGS["bar_width"] + direction))
         elif selected == 3:
-            SETTINGS["gap"] = max(
-                0, min(4, SETTINGS["gap"] + direction)
-            )
+            SETTINGS["gap"] = max(0, min(4, SETTINGS["gap"] + direction))
         elif selected == 4:
             SETTINGS["sensitivity"] = round(
                 max(0.5, min(2.5, SETTINGS["sensitivity"] + direction * 0.1)), 1
@@ -348,7 +518,6 @@ def settings_menu():
             if not kitty_opacity(new_value):
                 return "Kitty opacity unavailable - check Kitty remote-control settings"
             return "Kitty opacity updated"
-
         return None
 
     message = ""
@@ -360,22 +529,48 @@ def settings_menu():
         for i, label in enumerate(rows):
             marker = "\x1b[1;36m ❯ " if i == selected else "   "
             end = "\x1b[0m" if i == selected else ""
-            out.append(f"{marker}{label:<18} {value_for(i):>12}{end}\n")
+            out.append(f"{marker}{label:<22} {value_for(i):>14}{end}\n")
 
         if message:
             out.append(f"\n {message}\n")
-
+        if update_prompt:
+            out.append("\n [U] Update now (copy link + open GitHub)   [X] Update later\n")
         out.append("\n " + help_text + "\n")
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
         for key in read_keys():
+            if update_prompt and key in ("u", "U"):
+                message = open_update_page()
+                update_prompt = False
+                if update_ui_state is not None:
+                    update_ui_state["dismissed"] = True
+                continue
+            if update_prompt and key in ("x", "X"):
+                message = "Update postponed. You can check again later."
+                update_prompt = False
+                if update_ui_state is not None:
+                    update_ui_state["dismissed"] = True
+                continue
+
             if key in UP:
                 selected = (selected - 1) % len(rows)
                 message = ""
             elif key in DOWN:
                 selected = (selected + 1) % len(rows)
                 message = ""
+            elif selected == len(rows) - 1 and key in ("\r", "\n"):
+                if update_checker is None:
+                    message = "Update checker is unavailable."
+                else:
+                    state = update_checker.check_now()
+                    if state == "available":
+                        update_prompt = True
+                        message = "A newer Artcava.py is available on GitHub."
+                    elif state == "up_to_date":
+                        message = "Artcava is up to date!"
+                    else:
+                        message = "Couldn't check for updates. Check your internet connection."
             elif key in RIGHT or key in ("\r", "\n", "+", "="):
                 message = change(1) or ""
                 save_settings()
@@ -1028,6 +1223,11 @@ def main():
     original_opacity = kitty_configured_opacity()
     in_kitty = kitty_available()
 
+    # Check GitHub in the background. This never blocks startup or playback.
+    update_checker = UpdateChecker(os.path.realpath(__file__))
+    update_checker.start()
+    update_ui_state = {"dismissed": False}
+
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     debug = "--debug" in sys.argv
     forced = args[0] if args else None
@@ -1054,6 +1254,8 @@ def main():
     last = time.perf_counter()
     next_t = last
     quit_requested = False
+    action_message = ""
+    action_message_until = 0.0
 
     if in_kitty:
         kitty_opacity(SETTINGS["opacity"])
@@ -1070,7 +1272,30 @@ def main():
             last = now
 
             for key in read_keys(0):
-                cols, _ = shutil.get_terminal_size()
+                cols, lines = shutil.get_terminal_size()
+
+                notice_action = None
+                if not update_ui_state["dismissed"]:
+                    notice_action = update_notice_mouse_action(key, cols, lines)
+
+                if notice_action == "update" or (
+                    notice_action is None and key in ("u", "U")
+                    and update_checker.snapshot()[1] and not update_ui_state["dismissed"]
+                ):
+                    action_message = open_update_page()
+                    action_message_until = time.monotonic() + 5.0
+                    update_ui_state["dismissed"] = True
+                    continue
+
+                if notice_action == "later" or (
+                    notice_action is None and key in ("x", "X")
+                    and update_checker.snapshot()[1] and not update_ui_state["dismissed"]
+                ):
+                    update_ui_state["dismissed"] = True
+                    action_message = "Update reminder dismissed. Check again in Settings."
+                    action_message_until = time.monotonic() + 4.0
+                    continue
+
                 action = mouse_action(key, cols)
                 if action:
                     player_control(action)
@@ -1085,7 +1310,7 @@ def main():
                     player_control("play-pause")
                     continue
                 if key in ("s", "S"):
-                    settings_menu()
+                    settings_menu(update_checker, update_ui_state)
                     size = None
                     next_t = last = time.perf_counter()
                     break
@@ -1142,13 +1367,20 @@ def main():
             header = header_block(lyrics, cols, accent) if show_title else None
             extra = lyric_block(lyrics, cols, accent) if show_lyrics else None
 
-            sys.stdout.write(
-                render(
-                    vals, current, rows, analyzer.pulse,
-                    status_line(watcher) if debug else "",
-                    extra, header,
-                )
+            frame = render(
+                vals, current, rows, analyzer.pulse,
+                status_line(watcher) if debug else "",
+                extra, header,
             )
+
+            if action_message and time.monotonic() < action_message_until:
+                # A short-lived feedback line appears near the bottom after a click.
+                feedback = fit(action_message, max(1, cols - 2))
+                frame += f"\x1b[{max(1, lines - 1)};2H\x1b[38;2;170;210;255m{feedback}\x1b[0m"
+            elif update_checker.snapshot()[1] and not update_ui_state["dismissed"]:
+                frame += update_notice_overlay(cols, lines)
+
+            sys.stdout.write(frame)
             sys.stdout.flush()
 
             next_t += 1 / FPS
