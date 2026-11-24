@@ -57,6 +57,9 @@ DEFAULT_PALETTE = [(80, 160, 255), (200, 90, 255), (255, 90, 160)]
 CONFIG_DIR = os.path.expanduser("~/.config/artcava")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.json")
 
+VISUALIZATIONS = ("Bars", "Mirror")
+
+
 COLOR_PRESETS = {
     "Album art": None,
     "Ocean": [(35, 110, 255), (40, 220, 220), (190, 245, 255)],
@@ -72,6 +75,7 @@ COLOR_PRESETS = {
 
 DEFAULTS = {
     "color_mode": "Album art",
+    "visualization": "Bars",
     "bar_width": BAR_W,
     "gap": GAP,
     "sensitivity": 1.0,
@@ -113,6 +117,11 @@ def load_settings():
 
     if not isinstance(SETTINGS["color_mode"], str) or SETTINGS["color_mode"] not in COLOR_PRESETS:
         SETTINGS["color_mode"] = DEFAULTS["color_mode"]
+
+    # Older settings files, including files with removed experimental modes,
+    # safely fall back to the classic Bars visualization.
+    if SETTINGS.get("visualization") not in VISUALIZATIONS:
+        SETTINGS["visualization"] = "Bars"
 
     for flag in ("lyrics", "show_title"):
         if not isinstance(SETTINGS[flag], bool):
@@ -261,6 +270,7 @@ def settings_menu():
     """Display and edit Artcava's settings."""
     rows = [
         "Color theme",
+        "Visualization",
         "Bar width",
         "Bar spacing",
         "Sensitivity",
@@ -279,6 +289,7 @@ def settings_menu():
     def value_for(i):
         return [
             SETTINGS["color_mode"],
+            SETTINGS["visualization"],
             str(SETTINGS["bar_width"]),
             str(SETTINGS["gap"]),
             f'{SETTINGS["sensitivity"]:.1f}x',
@@ -297,34 +308,39 @@ def settings_menu():
                 (idx + direction) % len(color_names)
             ]
         elif selected == 1:
+            idx = VISUALIZATIONS.index(SETTINGS["visualization"])
+            SETTINGS["visualization"] = VISUALIZATIONS[
+                (idx + direction) % len(VISUALIZATIONS)
+            ]
+        elif selected == 2:
             SETTINGS["bar_width"] = max(
                 1, min(4, SETTINGS["bar_width"] + direction)
             )
-        elif selected == 2:
+        elif selected == 3:
             SETTINGS["gap"] = max(
                 0, min(4, SETTINGS["gap"] + direction)
             )
-        elif selected == 3:
+        elif selected == 4:
             SETTINGS["sensitivity"] = round(
                 max(0.5, min(2.5, SETTINGS["sensitivity"] + direction * 0.1)), 1
             )
-        elif selected == 4:
+        elif selected == 5:
             SETTINGS["release_time"] = round(
                 max(0.06, min(0.5, SETTINGS["release_time"] + direction * 0.02)), 2
             )
-        elif selected == 5:
+        elif selected == 6:
             SETTINGS["beat_flash"] = round(
                 max(0.0, min(1.0, SETTINGS["beat_flash"] + direction * 0.05)), 2
             )
-        elif selected == 6:
-            SETTINGS["lyrics"] = not SETTINGS["lyrics"]
         elif selected == 7:
+            SETTINGS["lyrics"] = not SETTINGS["lyrics"]
+        elif selected == 8:
             SETTINGS["lyrics_offset"] = round(
                 max(-5.0, min(5.0, SETTINGS["lyrics_offset"] + direction * 0.25)), 2
             )
-        elif selected == 8:
-            SETTINGS["show_title"] = not SETTINGS["show_title"]
         elif selected == 9:
+            SETTINGS["show_title"] = not SETTINGS["show_title"]
+        elif selected == 10:
             new_value = round(
                 max(0.10, min(1.0, SETTINGS["opacity"] + direction * 0.05)), 2
             )
@@ -952,10 +968,41 @@ def render_bars(vals, colors, rows, pulse):
     return lines
 
 
+def render_mirror(vals, colors, rows, pulse):
+    """Render a mirrored spectrum: each frequency bar extends both ways from center."""
+    flash = colors + (255 - colors) * (pulse * SETTINGS["beat_flash"])
+    q = (np.clip(flash, 0, 255).astype(int) >> 3) << 3
+    prefixes = [f"\x1b[38;2;{r};{g};{b}m" for r, g, b in q]
+
+    width = SETTINGS["bar_width"]
+    gap = " " * SETTINGS["gap"]
+    center_top = (rows - 1) // 2
+    center_bottom = rows // 2
+    max_distance = max(center_top, rows - 1 - center_bottom)
+    max_extent = max_distance + 1
+
+    output = []
+    for row in range(rows):
+        distance = min(abs(row - center_top), abs(row - center_bottom))
+        parts = []
+        for i, value in enumerate(vals):
+            height = int(np.ceil(float(np.clip(value, 0.0, 1.0)) * max_extent))
+            if distance < height:
+                parts.append(prefixes[i] + "█" * width + "\x1b[0m" + gap)
+            else:
+                parts.append(" " * width + gap)
+        output.append("".join(parts) + "\x1b[K")
+
+    return output
+
+
 def render(vals, colors, rows, pulse, status="", extra=None, header=None):
-    """Compose the classic bar visualizer with the shared header and lyrics."""
+    """Compose the selected spectrum style with the shared header and lyrics."""
     lines = list(header) if header else []
-    lines.extend(render_bars(vals, colors, rows, pulse))
+    if SETTINGS["visualization"] == "Mirror":
+        lines.extend(render_mirror(vals, colors, rows, pulse))
+    else:
+        lines.extend(render_bars(vals, colors, rows, pulse))
     if extra:
         lines.extend(extra)
     if status:
