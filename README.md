@@ -35,6 +35,33 @@ Designed for the **Kitty terminal**.
 | `[` | Shift lyrics timing backward |
 | `]` | Shift lyrics timing forward |
 
+## Kitty Transparency Setup
+
+Artcava's opacity control uses Kitty's remote-control feature. To enable it, add two settings to your Kitty configuration before using the opacity control.
+
+**1. Open a terminal and create or open Kitty's configuration file:**
+
+```bash
+mkdir -p ~/.config/kitty
+nano ~/.config/kitty/kitty.conf
+```
+
+**2. Add these two lines to the file:**
+
+```conf
+allow_remote_control yes
+dynamic_background_opacity yes
+```
+
+**3. Save the configuration:**
+
+- Press `Ctrl + O` to save.
+- Press `Enter` to confirm.
+- Press `Ctrl + X` to exit.
+
+Restart Kitty after saving the file. The opacity control will then be able to adjust Kitty's background opacity while Artcava is running. Artcava's other features can still be used without enabling this setting.
+
+
 ### Lyrics
 
 Artcava retrieves synchronized lyrics from [LRCLIB](https://lrclib.net).
