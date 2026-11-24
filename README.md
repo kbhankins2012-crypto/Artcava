@@ -18,15 +18,23 @@ Designed for the **Kitty terminal**.
 ## Features
 
 - **Real-time audio visualization:** Displays live audio frequencies in a CAVA-style bar visualizer.
+- **Multiple visualization modes:** Switch between Bars and Mirror visualizations.
 - **Dynamic album-art colors:** Automatically extracts colors from the currently playing song's album artwork and applies them to the visualizer.
 - **Synced lyrics:** Displays synchronized lyrics for the currently playing song using LRCLIB.
 - **Adjustable lyric timing:** Fine-tune lyric synchronization using `[` and `]`.
 - **Lyrics caching:** Saves fetched lyrics locally so they don't need to be downloaded again.
-- **Custom color presets:** Choose from multiple built-in color themes or use album-art colors.
+- **Custom color presets:** Choose from multiple built-in color themes, including Dreamy, or use album-art colors.
 - **Beat flash:** Bars subtly react to bass and beats.
-- **Customizable settings:** Adjust bar width, spacing, sensitivity, smoothing, colors, and lyrics.
+- **Customizable settings:** Adjust visualization mode, bar width, spacing, sensitivity, smoothing, colors, lyrics, and opacity.
 - **Persistent configuration:** Your settings are saved automatically.
 - **True-color terminal support:** Uses RGB colors for a more vibrant terminal experience.
+- **Live playback controls:** Control your music with keyboard shortcuts or clickable on-screen controls.
+- **Now-playing information:** Displays the current song title, artist, and album.
+- **Song progress bar:** Shows playback progress with elapsed and total track time.
+- **Kitty transparency support:** Adjust terminal background opacity directly from Artcava's settings.
+- **Automatic update checker:** Checks GitHub for newer versions in the background when Artcava launches.
+- **Update notifications:** Displays a small notification when an update is available, with options to update or dismiss it.
+- **Quick update access:** Opens the GitHub README and copies the link so users can access the Quick Install command.
 
 ### Additional Controls
 
