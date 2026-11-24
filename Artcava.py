@@ -1,13 +1,23 @@
+
 #!/usr/bin/env python3
 """
 Artcava - a cava-style terminal visualizer whose bars take their colors
 from the album art of whatever is currently playing.
 
-Audio : captured from your default output's monitor via parec
-Art   : read from MPRIS via playerctl
+Audio : captured from your default output's monitor via `parec`
+Art   : read from MPRIS via `playerctl`
 
-Keys  : S = settings   Q = quit   L = lyrics on/off
-        T = song title on/off   [ ] = nudge lyric timing
+Deps  : sudo apt install python3-numpy python3-pil playerctl pulseaudio-utils
+
+Keys  : S = settings   Q = quit   L = lyrics on/off   T = song title on/off
+        [ ] = nudge lyric timing
+
+Kitty transparency:
+    Add these to ~/.config/kitty/kitty.conf:
+        allow_remote_control yes
+        dynamic_background_opacity yes
+
+    Opacity is changed live using Kitty's remote-control interface.
 """
 import bisect
 import colorsys
@@ -44,7 +54,6 @@ COLOR_EASE_TIME = 0.22
 BEAT_FLASH = 0.32
 BLOCKS = " ▁▂▃▄▅▆▇█"
 DEFAULT_PALETTE = [(80, 160, 255), (200, 90, 255), (255, 90, 160)]
-
 CONFIG_DIR = os.path.expanduser("~/.config/artcava")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.json")
 
@@ -61,8 +70,6 @@ COLOR_PRESETS = {
     "White": [(130, 145, 165), (210, 220, 235), (255, 255, 255)],
 }
 
-BACKGROUND_MODES = ["Terminal", "Custom", "Album art"]
-
 DEFAULTS = {
     "color_mode": "Album art",
     "bar_width": BAR_W,
@@ -73,10 +80,7 @@ DEFAULTS = {
     "lyrics": True,
     "lyrics_offset": 0.0,
     "show_title": True,
-    "background_mode": "Terminal",
-    "background_r": 12,
-    "background_g": 12,
-    "background_b": 18,
+    "opacity": 1.0,
 }
 
 SETTINGS = dict(DEFAULTS)
@@ -88,13 +92,13 @@ LIMITS = [
     ("release_time", 0.06, 0.5, float),
     ("beat_flash", 0.0, 1.0, float),
     ("lyrics_offset", -5.0, 5.0, float),
-    ("background_r", 0, 255, int),
-    ("background_g", 0, 255, int),
-    ("background_b", 0, 255, int),
+    ("opacity", 0.10, 1.0, float),
 ]
 
 
+# -------------------------------------------------------------- settings --
 def load_settings():
+    """Load saved settings; missing or corrupt values use defaults."""
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             saved = json.load(f)
@@ -107,11 +111,9 @@ def load_settings():
         if key in saved:
             SETTINGS[key] = saved[key]
 
-    if SETTINGS["color_mode"] not in COLOR_PRESETS:
+    if (not isinstance(SETTINGS["color_mode"], str)
+            or SETTINGS["color_mode"] not in COLOR_PRESETS):
         SETTINGS["color_mode"] = DEFAULTS["color_mode"]
-
-    if SETTINGS["background_mode"] not in BACKGROUND_MODES:
-        SETTINGS["background_mode"] = "Terminal"
 
     for flag in ("lyrics", "show_title"):
         if not isinstance(SETTINGS[flag], bool):
@@ -141,29 +143,75 @@ def active_palette(album_palette):
     return album_palette if preset is None else preset
 
 
-def active_background(album_palette):
-    mode = SETTINGS["background_mode"]
+# --------------------------------------------------------------- Kitty --
+def kitty_available():
+    """Return whether this process appears to be running inside Kitty."""
+    return bool(os.environ.get("KITTY_WINDOW_ID")) and shutil.which("kitten") is not None
 
-    if mode == "Terminal":
-        return None
 
-    if mode == "Custom":
-        return (
-            SETTINGS["background_r"],
-            SETTINGS["background_g"],
-            SETTINGS["background_b"],
+def kitty_opacity(value):
+    """
+    Change Kitty's background opacity through its remote-control interface.
+
+    Requires:
+        allow_remote_control yes
+        dynamic_background_opacity yes
+
+    Returns True when Kitty accepts the command.
+    """
+    if not kitty_available():
+        return False
+
+    try:
+        result = subprocess.run(
+            [
+                "kitten", "@", "set-background-opacity",
+                "--match", f"id:{os.environ['KITTY_WINDOW_ID']}",
+                f"{float(value):.2f}",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
         )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
-    if mode == "Album art":
-        colors = np.array(album_palette, dtype=float)
-        rgb = colors.mean(axis=0) * 0.13
-        return tuple(np.clip(rgb, 0, 255).astype(int))
 
-    return None
+def kitty_configured_opacity():
+    """
+    Read the basic background_opacity setting from Kitty's main config.
+
+    Kitty's remote-control interface does not provide a direct query for
+    the currently active opacity. This reads the main config as a best-effort
+    restoration value. If it cannot be read, use Kitty's normal opaque value.
+    """
+    config = os.path.expanduser("~/.config/kitty/kitty.conf")
+    opacity = 1.0
+
+    try:
+        with open(config, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                match = re.match(r"^background_opacity\s+([0-9.]+)", line)
+                if match:
+                    try:
+                        opacity = max(0.0, min(1.0, float(match.group(1))))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+
+    return opacity
+
+
+def restore_kitty_opacity(original):
+    """Restore the opacity read from Kitty's configuration."""
+    if kitty_available():
+        kitty_opacity(original)
 
 
 # --------------------------------------------------------------- keyboard --
-
 KEY_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z~]|\x1bO[A-Za-z]|\x1b|.", re.S)
 UP, DOWN = ("\x1b[A", "\x1bOA"), ("\x1b[B", "\x1bOB")
 RIGHT, LEFT = ("\x1b[C", "\x1bOC"), ("\x1b[D", "\x1bOD")
@@ -179,17 +227,23 @@ def read_keys(timeout=None):
     return KEY_RE.findall(data.decode("utf-8", "ignore"))
 
 
+# --------------------------------------------------------------- menu --
 def settings_menu():
     rows = [
-        "Color theme", "Bar width", "Bar spacing", "Sensitivity",
-        "Bar smoothing", "Beat flash", "Lyrics", "Lyrics timing",
-        "Song title", "Background", "Background red",
-        "Background green", "Background blue"
+        "Color theme",
+        "Bar width",
+        "Bar spacing",
+        "Sensitivity",
+        "Bar smoothing",
+        "Beat flash",
+        "Lyrics",
+        "Lyrics timing",
+        "Song title",
+        "Opacity",
     ]
 
     selected = 0
     color_names = list(COLOR_PRESETS)
-
     help_text = "↑/↓ select   ←/→ change   Enter change   S/Esc close"
 
     def value_for(i):
@@ -203,10 +257,7 @@ def settings_menu():
             "On" if SETTINGS["lyrics"] else "Off",
             f'{SETTINGS["lyrics_offset"]:+.2f}s',
             "On" if SETTINGS["show_title"] else "Off",
-            SETTINGS["background_mode"],
-            str(SETTINGS["background_r"]),
-            str(SETTINGS["background_g"]),
-            str(SETTINGS["background_b"]),
+            f'{SETTINGS["opacity"]:.2f}',
         ][i]
 
     def change(direction):
@@ -215,72 +266,60 @@ def settings_menu():
             SETTINGS["color_mode"] = color_names[
                 (idx + direction) % len(color_names)
             ]
-
         elif selected == 1:
             SETTINGS["bar_width"] = max(
                 1, min(4, SETTINGS["bar_width"] + direction)
             )
-
         elif selected == 2:
             SETTINGS["gap"] = max(
                 0, min(4, SETTINGS["gap"] + direction)
             )
-
         elif selected == 3:
             SETTINGS["sensitivity"] = round(
-                max(0.5, min(2.5,
-                    SETTINGS["sensitivity"] + direction * 0.1)), 1
+                max(0.5, min(2.5, SETTINGS["sensitivity"] + direction * 0.1)),
+                1,
             )
-
         elif selected == 4:
             SETTINGS["release_time"] = round(
-                max(0.06, min(0.5,
-                    SETTINGS["release_time"] + direction * 0.02)), 2
+                max(0.06, min(0.5, SETTINGS["release_time"] + direction * 0.02)),
+                2,
             )
-
         elif selected == 5:
             SETTINGS["beat_flash"] = round(
-                max(0.0, min(1.0,
-                    SETTINGS["beat_flash"] + direction * 0.05)), 2
+                max(0.0, min(1.0, SETTINGS["beat_flash"] + direction * 0.05)),
+                2,
             )
-
         elif selected == 6:
             SETTINGS["lyrics"] = not SETTINGS["lyrics"]
-
         elif selected == 7:
             SETTINGS["lyrics_offset"] = round(
-                max(-5.0, min(5.0,
-                    SETTINGS["lyrics_offset"] + direction * 0.25)), 2
+                max(
+                    -5.0,
+                    min(5.0, SETTINGS["lyrics_offset"] + direction * 0.25),
+                ),
+                2,
             )
-
         elif selected == 8:
             SETTINGS["show_title"] = not SETTINGS["show_title"]
-
         elif selected == 9:
-            idx = BACKGROUND_MODES.index(SETTINGS["background_mode"])
-            SETTINGS["background_mode"] = BACKGROUND_MODES[
-                (idx + direction) % len(BACKGROUND_MODES)
-            ]
-
-        elif selected == 10:
-            SETTINGS["background_r"] = max(
-                0, min(255, SETTINGS["background_r"] + direction * 5)
+            new_value = round(
+                max(0.10, min(1.0, SETTINGS["opacity"] + direction * 0.05)),
+                2,
             )
+            SETTINGS["opacity"] = new_value
+            if not kitty_opacity(new_value):
+                # Keep the chosen setting saved, but explain why it did not apply.
+                return "Kitty opacity unavailable - check Kitty remote-control settings"
+            return "Kitty opacity updated"
 
-        elif selected == 11:
-            SETTINGS["background_g"] = max(
-                0, min(255, SETTINGS["background_g"] + direction * 5)
-            )
+        return None
 
-        elif selected == 12:
-            SETTINGS["background_b"] = max(
-                0, min(255, SETTINGS["background_b"] + direction * 5)
-            )
+    message = ""
 
     while True:
         out = [
             "\x1b[2J\x1b[H\x1b[1;36m A R T C A V A / S E T T I N G S\x1b[0m\n\n",
-            " Navigate with arrow keys. Changes apply immediately.\n\n"
+            " Navigate with arrow keys. Changes apply immediately.\n\n",
         ]
 
         for i, label in enumerate(rows):
@@ -290,6 +329,9 @@ def settings_menu():
                 f"{marker}{label:<18} {value_for(i):>12}{end}\n"
             )
 
+        if message:
+            out.append(f"\n {message}\n")
+
         out.append("\n " + help_text + "\n")
         sys.stdout.write("".join(out))
         sys.stdout.flush()
@@ -297,12 +339,16 @@ def settings_menu():
         for key in read_keys():
             if key in UP:
                 selected = (selected - 1) % len(rows)
+                message = ""
             elif key in DOWN:
                 selected = (selected + 1) % len(rows)
+                message = ""
             elif key in RIGHT or key in ("\r", "\n", "+", "="):
-                change(1)
+                message = change(1) or ""
+                save_settings()
             elif key in LEFT or key == "-":
-                change(-1)
+                message = change(-1) or ""
+                save_settings()
             elif key in ("\x1b", "s", "S", "q", "Q"):
                 save_settings()
                 return
@@ -312,12 +358,13 @@ MEDIANCUT = getattr(getattr(Image, "Quantize", Image), "MEDIANCUT")
 
 
 # -------------------------------------------------------------- album art --
-
 def load_image(src):
     if src.startswith("file://"):
         src = src[7:]
     if src.startswith(("http://", "https://")):
-        req = urllib.request.Request(src, headers={"User-Agent": "artcava"})
+        req = urllib.request.Request(
+            src, headers={"User-Agent": "artcava"}
+        )
         with urllib.request.urlopen(req, timeout=5) as r:
             return Image.open(io.BytesIO(r.read()))
     return Image.open(src)
@@ -331,10 +378,9 @@ def extract_palette(img, n=4):
     img = img.convert("RGB")
     w, h = img.size
     s = min(w, h)
-    img = img.crop((
-        (w - s) // 2, (h - s) // 2,
-        (w + s) // 2, (h + s) // 2
-    ))
+    img = img.crop(
+        ((w - s) // 2, (h - s) // 2, (w + s) // 2, (h + s) // 2)
+    )
     img = img.resize((96, 96))
 
     q = img.quantize(colors=12, method=MEDIANCUT)
@@ -343,12 +389,10 @@ def extract_palette(img, n=4):
     cands = []
 
     for count, idx in q.getcolors():
-        rgb = tuple(pal[idx * 3:idx * 3 + 3])
+        rgb = tuple(pal[idx * 3: idx * 3 + 3])
         hh, sat, val = colorsys.rgb_to_hsv(*(c / 255 for c in rgb))
-
         if val < 0.15:
             continue
-
         score = (count / total) ** 0.5 * (0.25 + sat) * (0.4 + val)
 
         if sat >= 0.2:
@@ -357,13 +401,14 @@ def extract_palette(img, n=4):
             val = max(val, 0.65)
 
         vivid = tuple(
-            int(c * 255) for c in colorsys.hsv_to_rgb(hh, sat, val)
+            int(c * 255)
+            for c in colorsys.hsv_to_rgb(hh, sat, val)
         )
         cands.append((score, vivid))
 
     cands.sort(reverse=True)
-
     chosen = []
+
     for score, rgb in cands:
         if all(_dist(rgb, c) > 80 for c in chosen):
             chosen.append(rgb)
@@ -374,7 +419,6 @@ def extract_palette(img, n=4):
         return DEFAULT_PALETTE
 
     ordered = [chosen.pop(0)]
-
     while chosen:
         nxt = min(chosen, key=lambda c: _dist(c, ordered[-1]))
         chosen.remove(nxt)
@@ -390,9 +434,10 @@ def gradient(colors, n):
     stops = np.array(colors, dtype=float)
     xs = np.linspace(0, 1, len(stops))
     t = np.linspace(0, 1, n)
-    return np.stack([
-        np.interp(t, xs, stops[:, c]) for c in range(3)
-    ], axis=1)
+    return np.stack(
+        [np.interp(t, xs, stops[:, c]) for c in range(3)],
+        axis=1,
+    )
 
 
 class ArtWatcher(threading.Thread):
@@ -410,15 +455,18 @@ class ArtWatcher(threading.Thread):
 
         try:
             out = subprocess.run(
-                ["playerctl", "-a", "metadata", "--format",
-                 "{{status}}|{{mpris:artUrl}}"],
-                capture_output=True, text=True, timeout=2
+                [
+                    "playerctl", "-a", "metadata",
+                    "--format", "{{status}}|{{mpris:artUrl}}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
 
         paused_url = None
-
         for line in out.stdout.splitlines():
             status, _, url = line.partition("|")
             if status.strip() == "Playing":
@@ -434,10 +482,8 @@ class ArtWatcher(threading.Thread):
 
             if url is None:
                 pass
-
             elif url == self.last_url:
                 self.fails = 0
-
             elif url:
                 self.empties = 0
                 try:
@@ -448,7 +494,6 @@ class ArtWatcher(threading.Thread):
                     self.fails += 1
                     if self.fails >= 3:
                         self.palette = DEFAULT_PALETTE
-
             else:
                 self.empties += 1
                 if self.empties >= 3 and self.last_url != "":
@@ -459,17 +504,22 @@ class ArtWatcher(threading.Thread):
 
 
 # ---------------------------------------------------------------- audio --
-
 class AudioReader(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.proc = subprocess.Popen(
-            ["parec", "--format=s16le", f"--rate={RATE}",
-             "--channels=1", "--latency-msec=10",
-             "-d", "@DEFAULT_MONITOR@"],
+            [
+                "parec",
+                "--format=s16le",
+                f"--rate={RATE}",
+                "--channels=1",
+                "--latency-msec=10",
+                "-d",
+                "@DEFAULT_MONITOR@",
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            bufsize=0
+            bufsize=0,
         )
         self.buf = np.zeros(FFT_SIZE, dtype=np.float64)
         self.buf_lock = threading.Lock()
@@ -480,27 +530,21 @@ class AudioReader(threading.Thread):
 
     def run(self):
         leftover = b""
-
         while True:
             data = self.proc.stdout.read(2048)
             if not data:
                 break
 
             data = leftover + data
-
             if len(data) % 2:
                 leftover, data = data[-1:], data[:-1]
             else:
                 leftover = b""
 
-            new = np.frombuffer(
-                data, dtype=np.int16
-            ).astype(np.float64) / 32768
+            new = np.frombuffer(data, dtype=np.int16).astype(np.float64) / 32768
 
             with self.buf_lock:
-                self.buf = np.concatenate(
-                    (self.buf, new)
-                )[-FFT_SIZE:]
+                self.buf = np.concatenate((self.buf, new))[-FFT_SIZE:]
 
 
 class Analyzer:
@@ -508,7 +552,6 @@ class Analyzer:
         self.nbars = nbars
         self.window = np.hanning(FFT_SIZE)
         self.freqs = np.fft.rfftfreq(N_FFT, 1 / RATE)
-
         edges = np.geomspace(FREQ_LO, FREQ_HI, nbars + 1)
         self.centers = np.sqrt(edges[:-1] * edges[1:])
         self.slices = []
@@ -526,10 +569,9 @@ class Analyzer:
         self.pulse = 0.0
 
     def update(self, samples, dt):
-        mag = np.abs(np.fft.rfft(
-            samples * self.window, n=N_FFT
-        ))
-
+        mag = np.abs(
+            np.fft.rfft(samples * self.window, n=N_FFT)
+        )
         raw = np.empty(self.nbars)
 
         for i, (lo, hi) in enumerate(self.slices):
@@ -542,9 +584,10 @@ class Analyzer:
 
         raw *= self.tilt * SETTINGS["sensitivity"]
         self.peak = max(
-            self.peak * 0.5 ** (dt / 4), raw.max(), 2.0
+            self.peak * 0.5 ** (dt / 4),
+            raw.max(),
+            2.0,
         )
-
         v = (raw / self.peak) ** 0.7
 
         sm = v.copy()
@@ -557,10 +600,7 @@ class Analyzer:
         v = np.clip(sm, 0.0, 1.0)
 
         attack = 1.0 - np.exp(-dt / ATTACK_TIME)
-        release = 1.0 - np.exp(
-            -dt / SETTINGS["release_time"]
-        )
-
+        release = 1.0 - np.exp(-dt / SETTINGS["release_time"])
         rising = v > self.vals
         coeff = np.where(rising, attack, release)
         self.vals += (v - self.vals) * coeff
@@ -570,46 +610,38 @@ class Analyzer:
         self.bass_avg += (bass - self.bass_avg) * min(1.0, dt * 6)
         self.pulse = max(
             self.pulse * 0.82 ** (dt * 60),
-            min(1.0, hit * 5)
+            min(1.0, hit * 5),
         )
 
         return self.vals
 
 
 # ---------------------------------------------------------------- lyrics --
-
 LRCLIB = "https://lrclib.net/api"
 USER_AGENT = "Artcava (https://github.com/kbhankins2012-crypto/Artcava)"
 LYRIC_CACHE = os.path.expanduser("~/.cache/artcava/lyrics")
 LYRIC_ROWS = 4
 HEADER_ROWS = 2
 SEP = "\x1f"
-
 LRC_TAG = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
 LRC_WORD = re.compile(r"<\d+:\d+(?:\.\d+)?>")
-
 TITLE_NOISE = re.compile(
     r"\s*[\(\[][^\)\]]*(official|lyric|video|audio|visuali[sz]er|\bhd\b|4k)[^\)\]]*[\)\]]",
-    re.I
+    re.I,
 )
 
 
 def parse_lrc(text):
     out = []
-
     for raw in text.splitlines():
         tags = LRC_TAG.findall(raw)
         if not tags:
             continue
-
         line = LRC_WORD.sub("", LRC_TAG.sub("", raw)).strip()
-
         for minutes, seconds in tags:
-            out.append((
-                int(minutes) * 60 + float(seconds),
-                line
-            ))
-
+            out.append(
+                (int(minutes) * 60 + float(seconds), line)
+            )
     out.sort(key=lambda item: item[0])
     return out
 
@@ -619,7 +651,6 @@ def http_json(path, params):
     req = urllib.request.Request(
         url, headers={"User-Agent": USER_AGENT}
     )
-
     with urllib.request.urlopen(req, timeout=6) as r:
         return json.load(r)
 
@@ -646,23 +677,24 @@ def fetch_synced(artist, title, album, length):
     if album and length:
         for a, t in cands:
             try:
-                d = http_json("get", {
-                    "artist_name": a,
-                    "track_name": t,
-                    "album_name": album,
-                    "duration": round(length)
-                })
-
+                d = http_json(
+                    "get",
+                    {
+                        "artist_name": a,
+                        "track_name": t,
+                        "album_name": album,
+                        "duration": round(length),
+                    },
+                )
                 if d.get("syncedLyrics"):
                     return d["syncedLyrics"]
-
             except Exception:
                 pass
 
     for a, t in cands:
         for params in (
             {"track_name": t, "artist_name": a},
-            {"q": f"{a} {t}"}
+            {"q": f"{a} {t}"},
         ):
             try:
                 results = http_json("search", params)
@@ -680,12 +712,10 @@ def fetch_synced(artist, title, album, length):
                         (r.get("duration") or 0) - length
                     )
                 )
-
                 if ok and abs(
                     (ok[0].get("duration") or 0) - length
                 ) <= 10:
                     return ok[0]["syncedLyrics"]
-
             elif ok:
                 return ok[0]["syncedLyrics"]
 
@@ -693,13 +723,12 @@ def fetch_synced(artist, title, album, length):
 
 
 def cache_file(artist, title, album, length):
-    key = SEP.join([
-        artist, title, album, str(round(length or 0))
-    ])
-
+    key = SEP.join(
+        [artist, title, album, str(round(length or 0))]
+    )
     return os.path.join(
         LYRIC_CACHE,
-        hashlib.sha1(key.encode()).hexdigest() + ".lrc"
+        hashlib.sha1(key.encode()).hexdigest() + ".lrc",
     )
 
 
@@ -744,15 +773,23 @@ class LyricsWatcher(threading.Thread):
 
     @staticmethod
     def now_playing():
-        fmt = SEP.join([
-            "{{playerName}}", "{{status}}", "{{artist}}",
-            "{{title}}", "{{album}}", "{{mpris:length}}"
-        ])
+        fmt = SEP.join(
+            [
+                "{{playerName}}",
+                "{{status}}",
+                "{{artist}}",
+                "{{title}}",
+                "{{album}}",
+                "{{mpris:length}}",
+            ]
+        )
 
         try:
             out = subprocess.run(
                 ["playerctl", "-a", "metadata", "--format", fmt],
-                capture_output=True, text=True, timeout=2
+                capture_output=True,
+                text=True,
+                timeout=2,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
@@ -761,7 +798,6 @@ class LyricsWatcher(threading.Thread):
 
         for line in out.stdout.splitlines():
             f = line.split(SEP)
-
             if len(f) != 6 or not f[3].strip():
                 continue
 
@@ -772,7 +808,7 @@ class LyricsWatcher(threading.Thread):
 
             info = (
                 f[0], f[1].strip(), f[2].strip(),
-                f[3].strip(), f[4].strip(), length
+                f[3].strip(), f[4].strip(), length,
             )
 
             if info[1] == "Playing":
@@ -787,37 +823,34 @@ class LyricsWatcher(threading.Thread):
         try:
             out = subprocess.run(
                 ["playerctl", f"--player={player}", "position"],
-                capture_output=True, text=True, timeout=2
+                capture_output=True,
+                text=True,
+                timeout=2,
             )
             return float(out.stdout.strip())
-
         except (
             FileNotFoundError,
             subprocess.TimeoutExpired,
-            ValueError
+            ValueError,
         ):
             return None
 
     def poll(self):
-        if not (
-            SETTINGS["lyrics"] or SETTINGS["show_title"]
-        ):
+        if not (SETTINGS["lyrics"] or SETTINGS["show_title"]):
             self.key = None
             self.data = ("idle", [], [])
             return
 
         info = self.now_playing()
-
         if info is None:
             self.track = None
             return
 
         player, status, artist, title, album, length = info
-
         self.track = (
             title,
             album,
-            re.sub(r"\s*-\s*Topic$", "", artist).strip()
+            re.sub(r"\s*-\s*Topic$", "", artist).strip(),
         )
 
         if not SETTINGS["lyrics"]:
@@ -826,7 +859,6 @@ class LyricsWatcher(threading.Thread):
             return
 
         pos = self.read_position(player)
-
         if pos is not None:
             self.anchor_pos = pos
             self.anchor_t = time.monotonic()
@@ -838,18 +870,14 @@ class LyricsWatcher(threading.Thread):
         if key != self.key:
             self.key = key
             self.data = ("loading", [], [])
-
-            text = load_lyrics(
-                artist, title, album, length
-            )
-
+            text = load_lyrics(artist, title, album, length)
             parsed = parse_lrc(text) if text else []
 
             if parsed:
                 self.data = (
                     "ok",
                     [t for t, _ in parsed],
-                    [l for _, l in parsed]
+                    [l for _, l in parsed],
                 )
             else:
                 self.data = ("none", [], [])
@@ -860,16 +888,13 @@ class LyricsWatcher(threading.Thread):
                 self.poll()
             except Exception:
                 pass
-
             time.sleep(0.5)
 
 
-# --------------------------------------------------------------- text --
-
+# -------------------------------------------------------------- text layout --
 def char_width(c):
     if unicodedata.combining(c):
         return 0
-
     return 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
 
 
@@ -882,13 +907,10 @@ def fit(s, width):
         return s
 
     out, w = "", 0
-
     for c in s:
         cw = char_width(c)
-
         if w + cw > width - 1:
             break
-
         out += c
         w += cw
 
@@ -903,7 +925,6 @@ def header_block(watcher, cols, accent):
         return [blank] * HEADER_ROWS
 
     title, album, artist = track
-
     title = TITLE_NOISE.sub("", title).strip() or title
     album = re.sub(
         r"\s*-\s*(single|ep)$", "", album, flags=re.I
@@ -915,51 +936,41 @@ def header_block(watcher, cols, accent):
     r, g, b = (int(c) for c in accent)
     bold = f"\x1b[1;38;2;{r};{g};{b}m"
     dim = "\x1b[38;2;150;150;165m"
-
     width = max(1, cols - 2)
 
     for rest in ([album, artist], [artist], []):
         rest = [x for x in rest if x]
-
         total = text_width(title) + sum(
             3 + text_width(x) for x in rest
         )
 
         if total <= width:
             pad = " " * ((cols - total) // 2)
-
             line = (
                 pad + bold + title + dim
                 + "".join(" — " + x for x in rest)
                 + "\x1b[0m\x1b[K"
             )
-
             return [line] + [blank] * (HEADER_ROWS - 1)
 
     title = fit(title, width)
-
     line = (
         " " * ((cols - text_width(title)) // 2)
         + bold + title + "\x1b[0m\x1b[K"
     )
-
     return [line] + [blank] * (HEADER_ROWS - 1)
 
 
 def lyric_block(watcher, cols, accent):
     state, times, lines = watcher.data
-
     dim = "\x1b[38;2;110;110;125m"
-
     r, g, b = (int(c) for c in accent)
     bright = f"\x1b[1;38;2;{r};{g};{b}m"
 
     def center(text, style):
         if not text:
             return "\x1b[K"
-
         text = fit(text, max(1, cols - 2))
-
         return (
             " " * ((cols - text_width(text)) // 2)
             + style + text + "\x1b[0m\x1b[K"
@@ -968,7 +979,7 @@ def lyric_block(watcher, cols, accent):
     if state == "ok":
         i = bisect.bisect_right(
             times,
-            watcher.position() + SETTINGS["lyrics_offset"]
+            watcher.position() + SETTINGS["lyrics_offset"],
         ) - 1
 
         prev = lines[i - 1] if i >= 1 else ""
@@ -982,34 +993,28 @@ def lyric_block(watcher, cols, accent):
             "\x1b[K",
             center(prev, dim),
             center(cur, bright),
-            center(nxt, dim)
+            center(nxt, dim),
         ]
 
     msg = {
         "loading": "Searching for lyrics…",
-        "none": "No synced lyrics found"
+        "none": "No synced lyrics found",
     }.get(state, "")
 
     return [
-        "\x1b[K", "\x1b[K",
-        center(msg, dim), "\x1b[K"
+        "\x1b[K",
+        "\x1b[K",
+        center(msg, dim),
+        "\x1b[K",
     ]
 
 
-# --------------------------------------------------------------- render --
-
-def render(
-    vals, colors, rows, pulse, status="",
-    extra=None, header=None, background=None, cols=None
-):
-    flash = colors + (
-        255 - colors
-    ) * (pulse * SETTINGS["beat_flash"])
-
-    q = (
-        np.clip(flash, 0, 255).astype(int) >> 3
-    ) << 3
-
+# ---------------------------------------------------------------- render --
+def render(vals, colors, rows, pulse, status="", extra=None, header=None):
+    flash = colors + (255 - colors) * (
+        pulse * SETTINGS["beat_flash"]
+    )
+    q = (np.clip(flash, 0, 255).astype(int) >> 3) << 3
     prefixes = [
         f"\x1b[38;2;{r};{g};{b}m"
         for r, g, b in q
@@ -1017,7 +1022,6 @@ def render(
 
     heights = vals * rows * 8
     gap = " " * SETTINGS["gap"]
-
     lines = list(header) if header else []
 
     for row in range(rows):
@@ -1043,28 +1047,6 @@ def render(
     if status:
         lines.append(status + "\x1b[0m\x1b[K")
 
-    # Background rendering:
-    # Terminal mode leaves the background untouched, allowing Kitty
-    # to display its configured background and transparency.
-    if background is not None:
-        r, g, b = background
-        bg_code = f"\x1b[48;2;{r};{g};{b}m"
-
-        painted = []
-
-        for line in lines:
-            # Preserve the background when foreground styles reset.
-            line = line.replace("\x1b[0m", "\x1b[39m")
-
-            # Fill the remainder of each terminal line.
-            line += "\x1b[K"
-
-            painted.append(
-                bg_code + line + "\x1b[49m"
-            )
-
-        lines = painted
-
     return "\x1b[H" + "\n".join(lines)
 
 
@@ -1073,12 +1055,10 @@ def status_line(watcher):
         f"\x1b[48;2;{r};{g};{b}m    "
         for r, g, b in watcher.palette
     )
-
     return f"{sw}\x1b[0m {str(watcher.last_url)[-60:]}"
 
 
-# ---------------------------------------------------------------- main --
-
+# ------------------------------------------------------------------- main --
 def main():
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         sys.exit(
@@ -1088,11 +1068,11 @@ def main():
 
     load_settings()
 
-    args = [
-        a for a in sys.argv[1:]
-        if not a.startswith("--")
-    ]
+    # Read Kitty's configured opacity before Artcava changes it.
+    original_opacity = kitty_configured_opacity()
+    in_kitty = kitty_available()
 
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
     debug = "--debug" in sys.argv
     forced = args[0] if args else None
 
@@ -1104,7 +1084,6 @@ def main():
 
     try:
         reader = AudioReader()
-
     except FileNotFoundError:
         sys.exit(
             "parec not found - install pulseaudio-utils "
@@ -1115,7 +1094,6 @@ def main():
 
     size = None
     analyzer = None
-
     old_tty = termios.tcgetattr(sys.stdin.fileno())
     tty.setcbreak(sys.stdin.fileno())
 
@@ -1124,9 +1102,11 @@ def main():
     next_t = last
     quit_requested = False
 
-    sys.stdout.write(
-        "\x1b[?1049h\x1b[?25l\x1b[2J"
-    )
+    # Apply the saved opacity on startup, if running in a configured Kitty.
+    if in_kitty:
+        kitty_opacity(SETTINGS["opacity"])
+
+    sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J")
 
     try:
         while not quit_requested:
@@ -1157,70 +1137,56 @@ def main():
 
                 elif key in ("[", "]"):
                     step = -0.25 if key == "[" else 0.25
-
                     SETTINGS["lyrics_offset"] = round(
                         max(
                             -5.0,
                             min(
                                 5.0,
-                                SETTINGS["lyrics_offset"] + step
-                            )
+                                SETTINGS["lyrics_offset"] + step,
+                            ),
                         ),
-                        2
+                        2,
                     )
-
                     save_settings()
 
             if quit_requested:
                 break
 
-            cols, terminal_lines = shutil.get_terminal_size()
+            cols, lines = shutil.get_terminal_size()
 
-            if (cols, terminal_lines) != size:
-                size = (cols, terminal_lines)
-
+            if (cols, lines) != size:
+                size = (cols, lines)
                 nbars = max(
                     1,
                     (cols + SETTINGS["gap"])
-                    // (
-                        SETTINGS["bar_width"]
-                        + SETTINGS["gap"]
-                    )
+                    // (SETTINGS["bar_width"] + SETTINGS["gap"]),
                 )
-
                 analyzer = Analyzer(nbars)
-
                 current = gradient(
                     active_palette(watcher.palette),
-                    nbars
+                    nbars,
                 )
-
                 sys.stdout.write("\x1b[2J")
 
             target = gradient(
                 active_palette(watcher.palette),
-                analyzer.nbars
+                analyzer.nbars,
             )
-
-            color_ease = 1.0 - np.exp(
-                -dt / COLOR_EASE_TIME
-            )
-
+            color_ease = 1.0 - np.exp(-dt / COLOR_EASE_TIME)
             current += (target - current) * color_ease
 
             vals = analyzer.update(reader.snapshot(), dt)
 
-            roomy = terminal_lines >= 12
-
+            roomy = lines >= 12
             show_lyrics = SETTINGS["lyrics"] and roomy
             show_title = SETTINGS["show_title"] and roomy
 
             rows = max(
                 1,
-                terminal_lines - 1
+                lines - 1
                 - (LYRIC_ROWS if show_lyrics else 0)
                 - (HEADER_ROWS if show_title else 0)
-                - (1 if debug else 0)
+                - (1 if debug else 0),
             )
 
             mid = current[len(current) // 2]
@@ -1230,13 +1196,10 @@ def main():
                 header_block(lyrics, cols, accent)
                 if show_title else None
             )
-
             extra = (
                 lyric_block(lyrics, cols, accent)
                 if show_lyrics else None
             )
-
-            background = active_background(watcher.palette)
 
             sys.stdout.write(
                 render(
@@ -1247,11 +1210,8 @@ def main():
                     status_line(watcher) if debug else "",
                     extra,
                     header,
-                    background,
-                    cols
                 )
             )
-
             sys.stdout.flush()
 
             next_t += 1 / FPS
@@ -1266,18 +1226,22 @@ def main():
         pass
 
     finally:
-        reader.proc.terminate()
+        try:
+            reader.proc.terminate()
+        except Exception:
+            pass
+
+        # Restore Kitty's configured opacity when Artcava exits.
+        if in_kitty:
+            restore_kitty_opacity(original_opacity)
 
         termios.tcsetattr(
             sys.stdin.fileno(),
             termios.TCSADRAIN,
-            old_tty
+            old_tty,
         )
 
-        sys.stdout.write(
-            "\x1b[0m\x1b[?25h\x1b[?1049l"
-        )
-
+        sys.stdout.write("\x1b[?25h\x1b[?1049l")
         sys.stdout.flush()
 
 
