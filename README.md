@@ -13,17 +13,41 @@ Designed for the **Kitty terminal**.
 
 **Disclaimer:** Not every album cover is gonna turn into colors perfectly. Some covers might look a little different in the visualizer, and that's completely normal. Artcava does its best to match the colors, but the results won't always be exact.
 
+
 ## Features
 
-- **Real-time audio visualization** — Displays audio frequencies as animated bars.
-- **Dynamic album artwork colors** — Extracts colors from your currently playing album artwork.
-- **FFT audio analysis** — Uses NumPy to analyze audio frequencies.
-- **Smooth animations** — Adjustable release smoothing and sensitivity.
-- **Color presets** — Choose from multiple built-in color themes.
-- **Settings menu** — Customize your visualizer directly from the terminal.
-- **Beat flash** — Optional visual effects that respond to music.
-- **Saved settings** — Your preferences are saved automatically.
-- **True-color support** — Uses ANSI true color for terminal visuals.
+- **Real-time audio visualization:** Displays live audio frequencies in a CAVA-style bar visualizer.
+- **Dynamic album-art colors:** Automatically extracts colors from the currently playing song's album artwork and applies them to the visualizer.
+- **Synced lyrics:** Displays synchronized lyrics for the currently playing song using LRCLIB.
+- **Adjustable lyric timing:** Fine-tune lyric synchronization using `[` and `]`.
+- **Lyrics caching:** Saves fetched lyrics locally so they don't need to be downloaded again.
+- **Custom color presets:** Choose from multiple built-in color themes or use album-art colors.
+- **Beat flash:** Bars subtly react to bass and beats.
+- **Customizable settings:** Adjust bar width, spacing, sensitivity, smoothing, colors, and lyrics.
+- **Persistent configuration:** Your settings are saved automatically.
+- **True-color terminal support:** Uses RGB colors for a more vibrant terminal experience.
+
+### Additional Controls
+
+| Key | Action |
+|---|---|
+| `L` | Toggle lyrics on/off |
+| `[` | Shift lyrics timing backward |
+| `]` | Shift lyrics timing forward |
+
+### Lyrics
+
+Artcava retrieves synchronized lyrics from [LRCLIB](https://lrclib.net).
+
+Lyrics are cached locally in `~/.cache/artcava/lyrics/` so previously fetched lyrics don't need to be downloaded again.
+
+Lyrics can be enabled or disabled in the settings menu, and their timing can be adjusted whenever needed.
+
+### Updating
+
+Already have Artcava installed? Simply run the Quick Install command again to download the latest version.
+
+Your saved settings are preserved when updating.
 
 ## Quick Install
 
