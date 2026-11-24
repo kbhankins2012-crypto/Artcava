@@ -274,7 +274,7 @@ UPDATE_RAW_URL = (
     "kbhankins2012-crypto/Artcava/main/Artcava.py"
 )
 UPDATE_PAGE_URL = (
-    "https://github.com/kbhankins2012-crypto/Artcava/blob/main/Artcava.py"
+    "https://github.com/kbhankins2012-crypto/Artcava/blob/main/README.md"
 )
 UPDATE_USER_AGENT = "Artcava-Updater/1.0"
 
