@@ -10,6 +10,7 @@ Art   : read from MPRIS via `playerctl`
 Deps  : sudo apt install python3-numpy python3-pil playerctl pulseaudio-utils
 
 Keys  : S = settings   Q = quit   L = lyrics on/off   T = song title on/off
+        A = previous track   Space = pause/resume   D = next track
         [ ] = nudge lyric timing
 
 Kitty transparency:
@@ -212,18 +213,71 @@ def restore_kitty_opacity(original):
 
 
 # --------------------------------------------------------------- keyboard --
-KEY_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z~]|\x1bO[A-Za-z]|\x1b|.", re.S)
+KEY_RE = re.compile(
+    r"\x1b\[<\d+;\d+;\d+[mM]|"
+    r"\x1b\[[0-9;]*[A-Za-z~]|"
+    r"\x1bO[A-Za-z]|"
+    r"\x1b|.",
+    re.S,
+)
+
 UP, DOWN = ("\x1b[A", "\x1bOA"), ("\x1b[B", "\x1bOB")
 RIGHT, LEFT = ("\x1b[C", "\x1bOC"), ("\x1b[D", "\x1bOD")
+
+CONTROLS = "[<<] [||] [>>]"
+
+
+def player_control(action):
+    """Send a playback command to the active media player."""
+    try:
+        subprocess.run(
+            ["playerctl", action],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+
+def mouse_action(key, cols):
+    """Return a playback action when a header control is clicked."""
+    match = re.fullmatch(r"\x1b\[<(\d+);(\d+);(\d+)([mM])", key)
+
+    if not match:
+        return None
+
+    button, x, y, event = match.groups()
+    button, x, y = int(button), int(x), int(y)
+
+    # Only handle left-button presses on the first terminal row.
+    if button != 0 or event != "M" or y != 1:
+        return None
+
+    start = cols - len(CONTROLS) + 1
+    offset = x - start
+
+    if 0 <= offset <= 3:
+        return "previous"
+    if 5 <= offset <= 8:
+        return "play-pause"
+    if 10 <= offset <= 13:
+        return "next"
+
+    return None
 
 
 def read_keys(timeout=None):
     fd = sys.stdin.fileno()
+
     if timeout is not None and not select.select([fd], [], [], timeout)[0]:
         return []
+
     data = os.read(fd, 64)
+
     if not data:
         raise EOFError
+
     return KEY_RE.findall(data.decode("utf-8", "ignore"))
 
 
@@ -308,7 +362,6 @@ def settings_menu():
             )
             SETTINGS["opacity"] = new_value
             if not kitty_opacity(new_value):
-                # Keep the chosen setting saved, but explain why it did not apply.
                 return "Kitty opacity unavailable - check Kitty remote-control settings"
             return "Kitty opacity updated"
 
@@ -921,44 +974,47 @@ def header_block(watcher, cols, accent):
     blank = "\x1b[K"
     track = watcher.track
 
-    if not track:
-        return [blank] * HEADER_ROWS
-
-    title, album, artist = track
-    title = TITLE_NOISE.sub("", title).strip() or title
-    album = re.sub(
-        r"\s*-\s*(single|ep)$", "", album, flags=re.I
-    ).strip()
-
-    if album.lower() == title.lower():
-        album = ""
-
     r, g, b = (int(c) for c in accent)
     bold = f"\x1b[1;38;2;{r};{g};{b}m"
-    dim = "\x1b[38;2;150;150;165m"
-    width = max(1, cols - 2)
+    controls_style = "\x1b[1;38;2;220;220;235m"
 
-    for rest in ([album, artist], [artist], []):
-        rest = [x for x in rest if x]
-        total = text_width(title) + sum(
-            3 + text_width(x) for x in rest
-        )
+    control_width = text_width(CONTROLS)
+    available = max(1, cols - control_width - 4)
 
-        if total <= width:
-            pad = " " * ((cols - total) // 2)
-            line = (
-                pad + bold + title + dim
-                + "".join(" — " + x for x in rest)
-                + "\x1b[0m\x1b[K"
-            )
-            return [line] + [blank] * (HEADER_ROWS - 1)
+    metadata = ""
 
-    title = fit(title, width)
+    if track:
+        title, album, artist = track
+
+        title = TITLE_NOISE.sub("", title).strip() or title
+        album = re.sub(
+            r"\s*-\s*(single|ep)$", "", album, flags=re.I
+        ).strip()
+
+        if album.lower() == title.lower():
+            album = ""
+
+        rest = [x for x in (artist, album) if x]
+        metadata = title
+
+        if rest:
+            metadata += " — " + " — ".join(rest)
+
+        metadata = fit(metadata, available)
+
+    left = " " + bold + metadata + "\x1b[0m"
+    used = 1 + text_width(metadata)
+    padding = max(1, cols - used - control_width)
+
     line = (
-        " " * ((cols - text_width(title)) // 2)
-        + bold + title + "\x1b[0m\x1b[K"
+        left
+        + " " * padding
+        + controls_style
+        + CONTROLS
+        + "\x1b[0m\x1b[K"
     )
-    return [line] + [blank] * (HEADER_ROWS - 1)
+
+    return [line, blank]
 
 
 def lyric_block(watcher, cols, accent):
@@ -1106,7 +1162,14 @@ def main():
     if in_kitty:
         kitty_opacity(SETTINGS["opacity"])
 
-    sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J")
+    # Enter alternate screen and enable SGR mouse reporting.
+    sys.stdout.write(
+        "\x1b[?1049h"
+        "\x1b[?25l"
+        "\x1b[?1000h"
+        "\x1b[?1006h"
+        "\x1b[2J"
+    )
 
     try:
         while not quit_requested:
@@ -1115,6 +1178,28 @@ def main():
             last = now
 
             for key in read_keys(0):
+                cols, _ = shutil.get_terminal_size()
+
+                # Mouse controls in the header.
+                action = mouse_action(key, cols)
+
+                if action:
+                    player_control(action)
+                    continue
+
+                # Keyboard playback controls.
+                if key in ("a", "A"):
+                    player_control("previous")
+                    continue
+
+                if key in ("d", "D"):
+                    player_control("next")
+                    continue
+
+                if key == " ":
+                    player_control("play-pause")
+                    continue
+
                 if key in ("s", "S"):
                     settings_menu()
                     size = None
@@ -1241,7 +1326,13 @@ def main():
             old_tty,
         )
 
-        sys.stdout.write("\x1b[?25h\x1b[?1049l")
+        # Disable mouse reporting and restore the terminal.
+        sys.stdout.write(
+            "\x1b[?1006l"
+            "\x1b[?1000l"
+            "\x1b[?25h"
+            "\x1b[?1049l"
+        )
         sys.stdout.flush()
 
 
