@@ -11,7 +11,6 @@ Deps  : python3-numpy, python3-pil, playerctl, pulseaudio-utils
 Keys  : S = settings   Q = quit   L = lyrics on/off   T = song title on/off
         A = previous track   Space = pause/resume   D = next track
         [ ] = nudge lyric timing
-        Visualization modes: Bars, Orbit, Starfield, Beat Chaser
 
 Kitty transparency:
     Add these to ~/.config/kitty/kitty.conf:
@@ -26,7 +25,6 @@ import hashlib
 import io
 import json
 import os
-import random
 import re
 import select
 import shutil
@@ -39,7 +37,6 @@ import tty
 import unicodedata
 import urllib.parse
 import urllib.request
-from collections import deque
 
 import numpy as np
 from PIL import Image
@@ -73,10 +70,7 @@ COLOR_PRESETS = {
     "White": [(130, 145, 165), (210, 220, 235), (255, 255, 255)],
 }
 
-VISUALIZATIONS = ["Bars", "Orbit", "Starfield", "Beat Chaser"]
-
 DEFAULTS = {
-    "visualization": "Bars",
     "color_mode": "Album art",
     "bar_width": BAR_W,
     "gap": GAP,
@@ -116,9 +110,6 @@ def load_settings():
     for key in DEFAULTS:
         if key in saved:
             SETTINGS[key] = saved[key]
-
-    if not isinstance(SETTINGS["visualization"], str) or SETTINGS["visualization"] not in VISUALIZATIONS:
-        SETTINGS["visualization"] = DEFAULTS["visualization"]
 
     if not isinstance(SETTINGS["color_mode"], str) or SETTINGS["color_mode"] not in COLOR_PRESETS:
         SETTINGS["color_mode"] = DEFAULTS["color_mode"]
@@ -267,9 +258,8 @@ def read_keys(timeout=None):
 
 # --------------------------------------------------------------- menu --
 def settings_menu():
-    """Settings menu with a persistent visualization-mode selector."""
+    """Display and edit Artcava's settings."""
     rows = [
-        "Visualization",
         "Color theme",
         "Bar width",
         "Bar spacing",
@@ -287,8 +277,7 @@ def settings_menu():
     help_text = "↑/↓ select   ←/→ change   Enter change   S/Esc close"
 
     def value_for(i):
-        values = [
-            SETTINGS["visualization"],
+        return [
             SETTINGS["color_mode"],
             str(SETTINGS["bar_width"]),
             str(SETTINGS["gap"]),
@@ -299,46 +288,43 @@ def settings_menu():
             f'{SETTINGS["lyrics_offset"]:+.2f}s',
             "On" if SETTINGS["show_title"] else "Off",
             f'{SETTINGS["opacity"]:.2f}',
-        ]
-        return values[i]
+        ][i]
 
     def change(direction):
         if selected == 0:
-            idx = VISUALIZATIONS.index(SETTINGS["visualization"])
-            SETTINGS["visualization"] = VISUALIZATIONS[
-                (idx + direction) % len(VISUALIZATIONS)
-            ]
-            return f'Visualization: {SETTINGS["visualization"]}'
-        elif selected == 1:
             idx = color_names.index(SETTINGS["color_mode"])
             SETTINGS["color_mode"] = color_names[
                 (idx + direction) % len(color_names)
             ]
+        elif selected == 1:
+            SETTINGS["bar_width"] = max(
+                1, min(4, SETTINGS["bar_width"] + direction)
+            )
         elif selected == 2:
-            SETTINGS["bar_width"] = max(1, min(4, SETTINGS["bar_width"] + direction))
+            SETTINGS["gap"] = max(
+                0, min(4, SETTINGS["gap"] + direction)
+            )
         elif selected == 3:
-            SETTINGS["gap"] = max(0, min(4, SETTINGS["gap"] + direction))
-        elif selected == 4:
             SETTINGS["sensitivity"] = round(
                 max(0.5, min(2.5, SETTINGS["sensitivity"] + direction * 0.1)), 1
             )
-        elif selected == 5:
+        elif selected == 4:
             SETTINGS["release_time"] = round(
                 max(0.06, min(0.5, SETTINGS["release_time"] + direction * 0.02)), 2
             )
-        elif selected == 6:
+        elif selected == 5:
             SETTINGS["beat_flash"] = round(
                 max(0.0, min(1.0, SETTINGS["beat_flash"] + direction * 0.05)), 2
             )
-        elif selected == 7:
+        elif selected == 6:
             SETTINGS["lyrics"] = not SETTINGS["lyrics"]
-        elif selected == 8:
+        elif selected == 7:
             SETTINGS["lyrics_offset"] = round(
                 max(-5.0, min(5.0, SETTINGS["lyrics_offset"] + direction * 0.25)), 2
             )
-        elif selected == 9:
+        elif selected == 8:
             SETTINGS["show_title"] = not SETTINGS["show_title"]
-        elif selected == 10:
+        elif selected == 9:
             new_value = round(
                 max(0.10, min(1.0, SETTINGS["opacity"] + direction * 0.05)), 2
             )
@@ -362,6 +348,7 @@ def settings_menu():
 
         if message:
             out.append(f"\n {message}\n")
+
         out.append("\n " + help_text + "\n")
         sys.stdout.write("".join(out))
         sys.stdout.flush()
@@ -944,222 +931,7 @@ def lyric_block(watcher, cols, accent):
     return ["\x1b[K", "\x1b[K", center(msg, dim), "\x1b[K"]
 
 
-# ---------------------------------------------------------- visualizations --
-def color_escape(rgb, bold=False):
-    r, g, b = np.clip(np.asarray(rgb), 0, 255).astype(int)
-    prefix = "1;" if bold else ""
-    return f"\x1b[{prefix}38;2;{r};{g};{b}m"
-
-
-def put_cell(canvas, x, y, text):
-    """Safely place a one-cell glyph on a character canvas."""
-    h = len(canvas)
-    w = len(canvas[0]) if h else 0
-    if 0 <= x < w and 0 <= y < h:
-        canvas[y][x] = text
-
-
-def render_orbit(vals, colors, cols, rows, pulse):
-    """Radial spectrum: frequency bars extend outward from a central ring."""
-    canvas = [[" " for _ in range(cols)] for _ in range(rows)]
-    if cols < 12 or rows < 6:
-        return ["Terminal too small for Orbit".center(cols)[:cols]] + ["\x1b[K"] * max(0, rows - 1)
-
-    cx, cy = (cols - 1) / 2, (rows - 1) / 2
-    max_radius = max(2.0, min(cols * 0.34, rows * 0.38))
-    inner = max(1.5, max_radius * 0.30)
-    count = len(vals)
-    flash_amount = pulse * SETTINGS["beat_flash"]
-
-    # A soft center ring gives the radial bars a clear focal point.
-    for k in range(96):
-        angle = 2 * np.pi * k / 96
-        x = int(round(cx + np.cos(angle) * inner * 2.0))
-        y = int(round(cy + np.sin(angle) * inner))
-        c = np.array([95, 105, 125], dtype=float) * (0.65 + flash_amount * 0.35)
-        put_cell(canvas, x, y, color_escape(c) + "·\x1b[0m")
-
-    for i, value in enumerate(vals):
-        angle = (i / count) * 2 * np.pi - np.pi / 2
-        length = max(0.0, float(value)) * (max_radius - inner)
-        steps = max(1, int(length * 2.5))
-        for step in range(steps):
-            radius = inner + (step / max(1, steps - 1)) * length
-            x = int(round(cx + np.cos(angle) * radius * 2.0))
-            y = int(round(cy + np.sin(angle) * radius))
-            rgb = colors[i] + (255 - colors[i]) * flash_amount
-            glyph = "█" if step == steps - 1 else "▓"
-            put_cell(canvas, x, y, color_escape(rgb, bold=True) + glyph + "\x1b[0m")
-
-    center_color = np.mean(colors, axis=0) + (255 - np.mean(colors, axis=0)) * flash_amount
-    put_cell(canvas, int(round(cx)), int(round(cy)), color_escape(center_color, True) + "●\x1b[0m")
-    return ["".join(row) + "\x1b[K" for row in canvas]
-
-
-def render_starfield(vals, colors, cols, rows, pulse, elapsed):
-    """Album-art-colored stars arranged on a circular orbit, flashing to the beat."""
-    canvas = [[" " for _ in range(cols)] for _ in range(rows)]
-    if cols < 12 or rows < 6:
-        return ["Terminal too small for Starfield".center(cols)[:cols]] + ["\x1b[K"] * max(0, rows - 1)
-
-    cx, cy = (cols - 1) / 2, (rows - 1) / 2
-    rx = max(3.0, min(cols * 0.36, rows * 0.72))
-    ry = max(2.0, min(rows * 0.34, cols * 0.16))
-    count = max(16, min(56, len(vals)))
-    beat = pulse * SETTINGS["beat_flash"]
-
-    # Circular dotted orbit behind the stars.
-    for k in range(120):
-        angle = 2 * np.pi * k / 120
-        x = int(round(cx + np.cos(angle) * rx))
-        y = int(round(cy + np.sin(angle) * ry))
-        dim = np.array([105, 115, 135], dtype=float) * (0.45 + beat * 0.45)
-        put_cell(canvas, x, y, color_escape(dim) + "·\x1b[0m")
-
-    # Each star samples a different frequency band and brightens with that band.
-    for i in range(count):
-        band = int(i * len(vals) / count) % len(vals)
-        value = float(vals[band])
-        angle = (2 * np.pi * i / count) - np.pi / 2
-        wobble = np.sin(elapsed * 2.2 + i * 0.8) * 0.04
-        radius_x = rx * (1.0 + wobble + value * 0.08)
-        radius_y = ry * (1.0 + wobble + value * 0.08)
-        x = int(round(cx + np.cos(angle) * radius_x))
-        y = int(round(cy + np.sin(angle) * radius_y))
-
-        twinkle = 0.48 + 0.32 * (0.5 + 0.5 * np.sin(elapsed * (3.0 + value * 5) + i))
-        brightness = min(1.0, twinkle + value * 0.28 + beat * 0.55)
-        rgb = colors[band] * brightness + (255 - colors[band]) * (beat * 0.32)
-        glyph = "★" if value > 0.55 or beat > 0.55 else "✦"
-        put_cell(canvas, x, y, color_escape(rgb, bold=True) + glyph + "\x1b[0m")
-
-        # A tiny halo gives the orbiting stars a circular/astral look.
-        if value > 0.25:
-            hx = int(round(cx + np.cos(angle) * (radius_x - 1.4)))
-            hy = int(round(cy + np.sin(angle) * (radius_y - 0.7)))
-            halo = colors[band] * min(0.55, 0.18 + value * 0.25 + beat * 0.18)
-            put_cell(canvas, hx, hy, color_escape(halo) + "·\x1b[0m")
-
-    # Small pulsing center makes the star ring feel connected to the kick drum.
-    center_brightness = 0.35 + beat * 0.65
-    center_rgb = np.mean(colors, axis=0) * center_brightness + 255 * beat * 0.25
-    put_cell(canvas, int(round(cx)), int(round(cy)), color_escape(center_rgb, True) + "✧\x1b[0m")
-    return ["".join(row) + "\x1b[K" for row in canvas]
-
-
-class BeatChaser:
-    """Autonomous maze runner that collects music notes on detected beat hits."""
-    MAZE = (
-        "###############",
-        "#.....#.......#",
-        "#.###.#.#####.#",
-        "#...#.#.....#.#",
-        "###.#.###.#.#.#",
-        "#...#.....#...#",
-        "#.#######.###.#",
-        "#.............#",
-        "###############",
-    )
-
-    def __init__(self):
-        self.maze = [list(row) for row in self.MAZE]
-        self.height = len(self.maze)
-        self.width = len(self.maze[0])
-        self.player = (1, 1)
-        self.notes = {(5, 1), (9, 1), (13, 1), (2, 3), (7, 3), (11, 3),
-                      (3, 5), (7, 5), (13, 5), (4, 7), (9, 7), (13, 7)}
-        self.score = 0
-        self.last_beat = 0.0
-        self.beat_flash = 0.0
-        self.steps = 0
-
-    def open_cells(self):
-        return [
-            (x, y)
-            for y in range(1, self.height - 1)
-            for x in range(1, self.width - 1)
-            if self.maze[y][x] != "#" and (x, y) != self.player and (x, y) not in self.notes
-        ]
-
-    def path_to_nearest_note(self):
-        """Breadth-first search to the closest remaining note."""
-        if not self.notes:
-            return []
-        queue = deque([(self.player, [])])
-        visited = {self.player}
-        while queue:
-            pos, path = queue.popleft()
-            if pos in self.notes:
-                return path
-            x, y = pos
-            for nxt in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
-                nx, ny = nxt
-                if (0 <= ny < self.height and 0 <= nx < self.width
-                        and self.maze[ny][nx] != "#" and nxt not in visited):
-                    visited.add(nxt)
-                    queue.append((nxt, path + [nxt]))
-        return []
-
-    def update(self, pulse, elapsed):
-        # The FFT bass transient acts as the game's beat clock.
-        if pulse > 0.48 and elapsed - self.last_beat > 0.20:
-            self.last_beat = elapsed
-            self.beat_flash = 1.0
-            path = self.path_to_nearest_note()
-            if path:
-                self.player = path[0]
-                self.steps += 1
-                if self.player in self.notes:
-                    self.notes.remove(self.player)
-                    self.score += 1
-            # Keep the game alive after the first group of notes is collected.
-            if len(self.notes) < 5:
-                candidates = self.open_cells()
-                if candidates:
-                    self.notes.add(random.choice(candidates))
-        self.beat_flash = max(0.0, self.beat_flash - 0.055)
-
-    def render(self, cols, rows, colors):
-        canvas = [[" " for _ in range(cols)] for _ in range(rows)]
-        maze_x = max(0, (cols - self.width) // 2)
-        maze_y = max(0, (rows - self.height - 2) // 2 + 1)
-        main_color = np.mean(colors, axis=0)
-        wall_color = main_color * (0.62 + self.beat_flash * 0.38)
-        note_color = np.array([255, 255, 255]) * (0.68 + self.beat_flash * 0.32)
-        for y, row in enumerate(self.maze):
-            for x, cell in enumerate(row):
-                sx, sy = maze_x + x, maze_y + y
-                if not (0 <= sx < cols and 0 <= sy < rows):
-                    continue
-                if cell == "#":
-                    glyph = "█"
-                    style = color_escape(wall_color, True)
-                elif (x, y) in self.notes:
-                    glyph = "♪"
-                    style = color_escape(note_color, True)
-                else:
-                    glyph = " "
-                    style = ""
-                canvas[sy][sx] = style + glyph + ("\x1b[0m" if style else "")
-
-        px, py = self.player
-        sx, sy = maze_x + px, maze_y + py
-        if 0 <= sx < cols and 0 <= sy < rows:
-            player_color = np.array([255, 255, 255]) * (0.72 + self.beat_flash * 0.28)
-            canvas[sy][sx] = color_escape(player_color, True) + "◉\x1b[0m"
-
-        title = f"BEAT CHASER   NOTES {self.score}   MOVES {self.steps}"
-        title_y = min(rows - 1, max(0, maze_y - 1))
-        title_x = max(0, (cols - len(title)) // 2)
-        for i, char in enumerate(title[:max(0, cols - title_x)]):
-            if 0 <= title_y < rows:
-                canvas[title_y][title_x + i] = color_escape(main_color, True) + char + "\x1b[0m"
-
-        if rows < self.height + 3 or cols < self.width:
-            return ["Terminal too small for Beat Chaser".center(cols)[:cols]] + ["\x1b[K"] * max(0, rows - 1)
-        return ["".join(line) + "\x1b[K" for line in canvas]
-
-
+# --------------------------------------------------------------- render --
 def render_bars(vals, colors, rows, pulse):
     flash = colors + (255 - colors) * (pulse * SETTINGS["beat_flash"])
     q = (np.clip(flash, 0, 255).astype(int) >> 3) << 3
@@ -1180,25 +952,16 @@ def render_bars(vals, colors, rows, pulse):
     return lines
 
 
-def render(vals, colors, rows, pulse, status="", extra=None, header=None,
-           mode="Bars", cols=80, elapsed=0.0, game=None):
-    """Compose the selected visualization with the shared header and lyrics."""
+def render(vals, colors, rows, pulse, status="", extra=None, header=None):
+    """Compose the classic bar visualizer with the shared header and lyrics."""
     lines = list(header) if header else []
-    if mode == "Orbit":
-        art = render_orbit(vals, colors, cols, rows, pulse)
-    elif mode == "Starfield":
-        art = render_starfield(vals, colors, cols, rows, pulse, elapsed)
-    elif mode == "Beat Chaser" and game is not None:
-        game.update(pulse, elapsed)
-        art = game.render(cols, rows, colors)
-    else:
-        art = render_bars(vals, colors, rows, pulse)
-    lines.extend(art)
+    lines.extend(render_bars(vals, colors, rows, pulse))
     if extra:
         lines.extend(extra)
     if status:
         lines.append(status + "\x1b[0m\x1b[K")
     return "\x1b[H" + "\n".join(lines) + "\x1b[J"
+
 
 
 def status_line(watcher):
@@ -1235,7 +998,6 @@ def main():
         sys.exit(f"Could not start audio capture: {exc}")
     reader.start()
 
-    game = BeatChaser()
     size = None
     analyzer = None
     old_tty = termios.tcgetattr(sys.stdin.fileno())
@@ -1244,7 +1006,6 @@ def main():
     current = None
     last = time.perf_counter()
     next_t = last
-    start_time = time.monotonic()
     quit_requested = False
 
     if in_kitty:
@@ -1333,15 +1094,12 @@ def main():
             accent = mid + (255 - mid) * 0.35
             header = header_block(lyrics, cols, accent) if show_title else None
             extra = lyric_block(lyrics, cols, accent) if show_lyrics else None
-            elapsed = time.monotonic() - start_time
 
             sys.stdout.write(
                 render(
                     vals, current, rows, analyzer.pulse,
                     status_line(watcher) if debug else "",
                     extra, header,
-                    mode=SETTINGS["visualization"],
-                    cols=cols, elapsed=elapsed, game=game,
                 )
             )
             sys.stdout.flush()
