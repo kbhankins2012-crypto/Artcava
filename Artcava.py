@@ -12,9 +12,12 @@ Usage : python3 Artcava.py                  # follow whatever is playing
         python3 Artcava.py cover.jpg        # force a local image / URL (for testing)
         python3 Artcava.py --debug          # show palette swatches + art URL on the bottom line
 
-Keys  : S = settings   Q = quit   (in settings: arrows or +/- to change, Esc/S/Q to close)
+Keys  : S = settings   Q = quit   L = lyrics on/off   [ ] = nudge lyric timing
+        (in settings: arrows or +/- to change, Esc/S/Q to close)
 """
+import bisect
 import colorsys
+import hashlib
 import io
 import json
 import os
@@ -27,6 +30,8 @@ import termios
 import threading
 import time
 import tty
+import unicodedata
+import urllib.parse
 import urllib.request
 
 import numpy as np
@@ -62,12 +67,14 @@ COLOR_PRESETS = {
 }
 
 DEFAULTS = {"color_mode": "Album art", "bar_width": BAR_W, "gap": GAP,
-            "sensitivity": 1.0, "release_time": RELEASE_TIME, "beat_flash": BEAT_FLASH}
+            "sensitivity": 1.0, "release_time": RELEASE_TIME, "beat_flash": BEAT_FLASH,
+            "lyrics": True, "lyrics_offset": 0.0}
 SETTINGS = dict(DEFAULTS)
 
 # (key, low, high, type) used to clamp whatever is in the settings file
 LIMITS = [("bar_width", 1, 4, int), ("gap", 0, 4, int), ("sensitivity", 0.5, 2.5, float),
-          ("release_time", 0.06, 0.5, float), ("beat_flash", 0.0, 1.0, float)]
+          ("release_time", 0.06, 0.5, float), ("beat_flash", 0.0, 1.0, float),
+          ("lyrics_offset", -5.0, 5.0, float)]
 
 
 def load_settings():
@@ -84,6 +91,8 @@ def load_settings():
             SETTINGS[key] = saved[key]
     if not isinstance(SETTINGS["color_mode"], str) or SETTINGS["color_mode"] not in COLOR_PRESETS:
         SETTINGS["color_mode"] = DEFAULTS["color_mode"]
+    if not isinstance(SETTINGS["lyrics"], bool):
+        SETTINGS["lyrics"] = DEFAULTS["lyrics"]
     for key, lo, hi, cast in LIMITS:
         try:
             value = cast(SETTINGS[key])
@@ -132,7 +141,8 @@ def read_keys(timeout=None):
 
 def settings_menu():
     """Small btop-inspired keyboard settings panel; called from the visualizer."""
-    rows = ["Color theme", "Bar width", "Bar spacing", "Sensitivity", "Bar smoothing", "Beat flash"]
+    rows = ["Color theme", "Bar width", "Bar spacing", "Sensitivity", "Bar smoothing", "Beat flash",
+            "Lyrics", "Lyrics timing"]
     selected = 0
     color_names = list(COLOR_PRESETS)
     help_text = "↑/↓ select   ←/→ change   Enter change   S/Esc close"
@@ -140,7 +150,8 @@ def settings_menu():
     def value_for(i):
         return [SETTINGS["color_mode"], str(SETTINGS["bar_width"]), str(SETTINGS["gap"]),
                 f'{SETTINGS["sensitivity"]:.1f}x', f'{SETTINGS["release_time"]:.2f}s',
-                f'{SETTINGS["beat_flash"]:.2f}'][i]
+                f'{SETTINGS["beat_flash"]:.2f}',
+                "On" if SETTINGS["lyrics"] else "Off", f'{SETTINGS["lyrics_offset"]:+.2f}s'][i]
 
     def change(direction):
         if selected == 0:
@@ -156,6 +167,10 @@ def settings_menu():
             SETTINGS["release_time"] = round(max(0.06, min(0.5, SETTINGS["release_time"] + direction * 0.02)), 2)
         elif selected == 5:
             SETTINGS["beat_flash"] = round(max(0.0, min(1.0, SETTINGS["beat_flash"] + direction * 0.05)), 2)
+        elif selected == 6:
+            SETTINGS["lyrics"] = not SETTINGS["lyrics"]
+        elif selected == 7:
+            SETTINGS["lyrics_offset"] = round(max(-5.0, min(5.0, SETTINGS["lyrics_offset"] + direction * 0.25)), 2)
 
     while True:
         out = ["\x1b[2J\x1b[H\x1b[1;36m A R T C A V A / S E T T I N G S\x1b[0m\n\n",
@@ -394,8 +409,244 @@ class Analyzer:
         return self.vals
 
 
+# ------------------------------------------------------------------ lyrics --
+# Synced lyrics come from LRCLIB (https://lrclib.net), a free community database.
+# Only the artist, title, album and length of the current song are sent, and only when
+# Lyrics is On. Fetched lyrics are cached in ~/.cache/artcava/lyrics/.
+LRCLIB = "https://lrclib.net/api"
+USER_AGENT = "Artcava (https://github.com/kbhankins2012-crypto/Artcava)"
+LYRIC_CACHE = os.path.expanduser("~/.cache/artcava/lyrics")
+LYRIC_ROWS = 4                     # blank spacer + previous / current / next line
+SEP = "\x1f"
+LRC_TAG = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
+LRC_WORD = re.compile(r"<\d+:\d+(?:\.\d+)?>")
+TITLE_NOISE = re.compile(
+    r"\s*[\(\[][^\)\]]*(official|lyric|video|audio|visuali[sz]er|\bhd\b|4k)[^\)\]]*[\)\]]", re.I)
+
+
+def parse_lrc(text):
+    """Turn LRC text into a time-sorted list of (seconds, line)."""
+    out = []
+    for raw in text.splitlines():
+        tags = LRC_TAG.findall(raw)
+        if not tags:
+            continue
+        line = LRC_WORD.sub("", LRC_TAG.sub("", raw)).strip()
+        for minutes, seconds in tags:
+            out.append((int(minutes) * 60 + float(seconds), line))
+    out.sort(key=lambda item: item[0])
+    return out
+
+
+def http_json(path, params):
+    url = f"{LRCLIB}/{path}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=6) as r:
+        return json.load(r)
+
+
+def fetch_synced(artist, title, album, length):
+    """Best-effort search for synced lyrics. Returns LRC text or None."""
+    artist = re.sub(r"\s*-\s*Topic$", "", artist).strip()
+    cands = []
+
+    def add(a, t):
+        t = TITLE_NOISE.sub("", t).strip()
+        if a and t and (a, t) not in cands:
+            cands.append((a, t))
+
+    add(artist, title)
+    add(artist.split(",")[0].strip(), title)
+    if " - " in title:                         # YouTube style "Artist - Song"
+        a2, t2 = title.split(" - ", 1)
+        add(a2.strip(), t2)
+    if not cands:
+        return None
+
+    if album and length:                       # exact lookup
+        for a, t in cands:
+            try:
+                d = http_json("get", {"artist_name": a, "track_name": t,
+                                      "album_name": album, "duration": round(length)})
+                if d.get("syncedLyrics"):
+                    return d["syncedLyrics"]
+            except Exception:
+                pass
+
+    for a, t in cands:                         # fuzzy search
+        for params in ({"track_name": t, "artist_name": a}, {"q": f"{a} {t}"}):
+            try:
+                results = http_json("search", params)
+            except Exception:
+                continue
+            ok = [r for r in results if isinstance(r, dict) and r.get("syncedLyrics")]
+            if length:
+                ok.sort(key=lambda r: abs((r.get("duration") or 0) - length))
+                if ok and abs((ok[0].get("duration") or 0) - length) <= 10:
+                    return ok[0]["syncedLyrics"]
+            elif ok:
+                return ok[0]["syncedLyrics"]
+    return None
+
+
+def cache_file(artist, title, album, length):
+    key = SEP.join([artist, title, album, str(round(length or 0))])
+    return os.path.join(LYRIC_CACHE, hashlib.sha1(key.encode()).hexdigest() + ".lrc")
+
+
+def load_lyrics(artist, title, album, length):
+    path = cache_file(artist, title, album, length)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        pass
+    text = fetch_synced(artist, title, album, length)
+    if text:
+        try:
+            os.makedirs(LYRIC_CACHE, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except OSError:
+            pass
+    return text
+
+
+class LyricsWatcher(threading.Thread):
+    """Follows the playing track + position via playerctl and loads its synced lyrics."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.data = ("idle", [], [])          # (state, times, lines); state: idle/loading/ok/none
+        self.key = None
+        self.playing = False
+        self.anchor_pos = 0.0
+        self.anchor_t = time.monotonic()
+
+    def position(self):
+        """Playback position in seconds, smoothly interpolated between polls."""
+        if self.playing:
+            return self.anchor_pos + (time.monotonic() - self.anchor_t)
+        return self.anchor_pos
+
+    @staticmethod
+    def now_playing():
+        fmt = SEP.join(["{{playerName}}", "{{status}}", "{{artist}}", "{{title}}",
+                        "{{album}}", "{{mpris:length}}"])
+        try:
+            out = subprocess.run(["playerctl", "-a", "metadata", "--format", fmt],
+                                 capture_output=True, text=True, timeout=2)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        first = None
+        for line in out.stdout.splitlines():
+            f = line.split(SEP)
+            if len(f) != 6 or not f[3].strip():
+                continue
+            try:
+                length = int(f[5]) / 1e6
+            except ValueError:
+                length = 0.0
+            info = (f[0], f[1].strip(), f[2].strip(), f[3].strip(), f[4].strip(), length)
+            if info[1] == "Playing":
+                return info
+            first = first or info
+        return first
+
+    @staticmethod
+    def read_position(player):
+        try:
+            out = subprocess.run(["playerctl", f"--player={player}", "position"],
+                                 capture_output=True, text=True, timeout=2)
+            return float(out.stdout.strip())
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+            return None
+
+    def poll(self):
+        if not SETTINGS["lyrics"]:
+            self.key = None
+            self.data = ("idle", [], [])
+            return
+        info = self.now_playing()
+        if info is None:
+            return
+        player, status, artist, title, album, length = info
+        pos = self.read_position(player)
+        if pos is not None:
+            self.anchor_pos, self.anchor_t = pos, time.monotonic()
+        self.playing = status == "Playing"
+
+        key = (artist, title, album, round(length))
+        if key != self.key:
+            self.key = key
+            self.data = ("loading", [], [])
+            text = load_lyrics(artist, title, album, length)
+            parsed = parse_lrc(text) if text else []
+            if parsed:
+                self.data = ("ok", [t for t, _ in parsed], [l for _, l in parsed])
+            else:
+                self.data = ("none", [], [])
+
+    def run(self):
+        while True:
+            try:
+                self.poll()
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+
+def char_width(c):
+    if unicodedata.combining(c):
+        return 0
+    return 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+
+
+def text_width(s):
+    return sum(char_width(c) for c in s)
+
+
+def fit(s, width):
+    """Trim s to fit `width` terminal columns, ending with an ellipsis if cut."""
+    if text_width(s) <= width:
+        return s
+    out, w = "", 0
+    for c in s:
+        cw = char_width(c)
+        if w + cw > width - 1:
+            break
+        out += c
+        w += cw
+    return out + "…"
+
+
+def lyric_block(watcher, cols, accent):
+    """LYRIC_ROWS terminal lines: a spacer, then previous / current / next lyric."""
+    state, times, lines = watcher.data
+    dim = "\x1b[38;2;110;110;125m"
+    r, g, b = (int(c) for c in accent)
+    bright = f"\x1b[1;38;2;{r};{g};{b}m"
+
+    def center(text, style):
+        if not text:
+            return "\x1b[K"
+        text = fit(text, max(1, cols - 2))
+        return " " * ((cols - text_width(text)) // 2) + style + text + "\x1b[0m\x1b[K"
+
+    if state == "ok":
+        i = bisect.bisect_right(times, watcher.position() + SETTINGS["lyrics_offset"]) - 1
+        prev = lines[i - 1] if i >= 1 else ""
+        cur = lines[i] if i >= 0 else ""
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        if i >= 0 and not cur:
+            cur = "♪"
+        return ["\x1b[K", center(prev, dim), center(cur, bright), center(nxt, dim)]
+    msg = {"loading": "Searching for lyrics…", "none": "No synced lyrics found"}.get(state, "")
+    return ["\x1b[K", "\x1b[K", center(msg, dim), "\x1b[K"]
+
+
 # ------------------------------------------------------------------ render --
-def render(vals, colors, rows, pulse, status=""):
+def render(vals, colors, rows, pulse, status="", extra=None):
     flash = colors + (255 - colors) * (pulse * SETTINGS["beat_flash"])
     q = (np.clip(flash, 0, 255).astype(int) >> 3) << 3
     prefixes = [f"\x1b[38;2;{r};{g};{b}m" for r, g, b in q]
@@ -412,6 +663,8 @@ def render(vals, colors, rows, pulse, status=""):
                 last = prefixes[i]
             parts.append(BLOCKS[e] * SETTINGS["bar_width"] + gap)
         lines.append("".join(parts) + "\x1b[0m")
+    if extra:
+        lines.extend(extra)
     if status:
         lines.append(status + "\x1b[0m\x1b[K")
     return "\x1b[H" + "\n".join(lines)
@@ -433,6 +686,8 @@ def main():
     forced = args[0] if args else None
     watcher = ArtWatcher(forced)
     watcher.start()
+    lyrics = LyricsWatcher()
+    lyrics.start()
     try:
         reader = AudioReader()
     except FileNotFoundError:
@@ -465,6 +720,14 @@ def main():
                 if key in ("q", "Q"):
                     quit_requested = True
                     break
+                if key in ("l", "L"):
+                    SETTINGS["lyrics"] = not SETTINGS["lyrics"]
+                    save_settings()
+                    sys.stdout.write("\x1b[2J")
+                elif key in ("[", "]"):
+                    step = -0.25 if key == "[" else 0.25
+                    SETTINGS["lyrics_offset"] = round(max(-5.0, min(5.0, SETTINGS["lyrics_offset"] + step)), 2)
+                    save_settings()
             if quit_requested:
                 break
 
@@ -481,9 +744,15 @@ def main():
             current += (target - current) * color_ease
 
             vals = analyzer.update(reader.snapshot(), dt)
-            rows = max(1, lines - (2 if debug else 1))
+            show_lyrics = SETTINGS["lyrics"] and lines >= 12
+            rows = max(1, lines - 1 - (LYRIC_ROWS if show_lyrics else 0) - (1 if debug else 0))
+            extra = None
+            if show_lyrics:
+                mid = current[len(current) // 2]
+                accent = mid + (255 - mid) * 0.35            # a lighter shade of the album color
+                extra = lyric_block(lyrics, cols, accent)
             sys.stdout.write(render(vals, current, rows, analyzer.pulse,
-                                    status_line(watcher) if debug else ""))
+                                    status_line(watcher) if debug else "", extra))
             sys.stdout.flush()
 
             next_t += 1 / FPS                         # fixed schedule = even frame spacing
