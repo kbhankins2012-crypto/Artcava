@@ -11,6 +11,7 @@ Deps  : python3-numpy, python3-pil, playerctl, pulseaudio-utils
 Keys  : S = settings   Q = quit   L = lyrics on/off   T = song title on/off
         A = previous track   Space = pause/resume   D = next track
         [ ] = nudge lyric timing
+        Mouse drag = move decorations (configure slots in Settings)
 
 Kitty transparency:
     Add these to ~/.config/kitty/kitty.conf:
@@ -19,6 +20,7 @@ Kitty transparency:
 
     Opacity is changed live using Kitty's remote-control interface.
 """
+import base64
 import bisect
 import colorsys
 import hashlib
@@ -90,7 +92,16 @@ DEFAULTS = {
     "opacity": 1.0,
 }
 
+DEFAULT_DECORATIONS = [
+    {"path": "", "x": 2, "y": 5, "width": 12, "height": 8},
+    {"path": "", "x": 18, "y": 5, "width": 12, "height": 8},
+    {"path": "", "x": 34, "y": 5, "width": 12, "height": 8},
+    {"path": "", "x": 50, "y": 5, "width": 12, "height": 8},
+    {"path": "", "x": 66, "y": 5, "width": 12, "height": 8},
+]
+
 SETTINGS = dict(DEFAULTS)
+SETTINGS["decorations"] = [dict(item) for item in DEFAULT_DECORATIONS]
 
 LIMITS = [
     ("bar_width", 1, 4, int),
@@ -138,6 +149,27 @@ def load_settings():
             SETTINGS[key] = max(lo, min(hi, value))
         except (TypeError, ValueError, OverflowError):
             SETTINGS[key] = DEFAULTS[key]
+
+    # Decoration paths and dimensions are loaded independently, so a damaged
+    # slot in settings.json cannot stop the rest of Artcava from launching.
+    raw_decorations = saved.get("decorations", DEFAULT_DECORATIONS)
+    if not isinstance(raw_decorations, list):
+        raw_decorations = []
+    normalized = []
+    for index, original in enumerate(DEFAULT_DECORATIONS):
+        item = dict(original)
+        try:
+            saved_item = raw_decorations[index]
+            if isinstance(saved_item, dict):
+                item["path"] = str(saved_item.get("path", ""))[:2048]
+                item["x"] = max(1, min(500, int(saved_item.get("x", item["x"]))))
+                item["y"] = max(1, min(300, int(saved_item.get("y", item["y"]))))
+                item["width"] = max(2, min(80, int(saved_item.get("width", item["width"]))))
+                item["height"] = max(2, min(50, int(saved_item.get("height", item["height"]))))
+        except (IndexError, TypeError, ValueError, OverflowError):
+            pass
+        normalized.append(item)
+    SETTINGS["decorations"] = normalized
 
 
 def save_settings():
@@ -206,6 +238,279 @@ def restore_kitty_opacity(original):
     """Restore the opacity read from Kitty's configuration."""
     if kitty_available():
         kitty_opacity(original)
+
+
+# ------------------------------------------------------------- decorations --
+def choose_decoration_file():
+    """Open a Linux file picker and return an image path, or an empty string."""
+    file_filter = "Images and GIFs | *.png *.jpg *.jpeg *.webp *.bmp *.gif"
+    commands = [
+        ["zenity", "--file-selection", "--title=Choose an Artcava decoration",
+         "--file-filter=" + file_filter],
+        ["kdialog", "--getopenfilename", os.path.expanduser("~"),
+         "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)"],
+    ]
+    for command in commands:
+        if not shutil.which(command[0]):
+            continue
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, timeout=120
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return os.path.abspath(os.path.expanduser(result.stdout.strip()))
+            return ""
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+    return ""
+
+
+class DecorationRenderer:
+    """Display five still images or GIFs using Kitty's graphics protocol."""
+
+    def __init__(self):
+        self.enabled = kitty_available()
+        # Process-specific IDs reduce the chance of colliding with another app
+        # that is also using Kitty graphics in the same terminal window.
+        base = (os.getpid() % 1000000) * 10 + 100
+        self.image_ids = [base + i for i in range(5)]
+        self.placement_ids = [base + 10 + i for i in range(5)]
+        self.images = [None] * 5
+        self.durations = [[] for _ in range(5)]
+        self.total_durations = [100] * 5
+        self.started = [time.monotonic()] * 5
+        self.uploaded = [None] * 5
+        self.dragging = None
+        self.drag_offset = (0, 0)
+        self.drag_dirty = False
+        self.reload()
+
+    @staticmethod
+    def _send(control, payload=""):
+        sys.stdout.write("\x1b_G" + control + (";" + payload if payload else "") + "\x1b\\")
+
+    def reload_slot(self, index):
+        old = self.images[index]
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
+        self.images[index] = None
+        self.durations[index] = []
+        self.total_durations[index] = 100
+        self.uploaded[index] = None
+        self.started[index] = time.monotonic()
+        path = SETTINGS["decorations"][index].get("path", "")
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            image = Image.open(path)
+            durations = []
+            frame_count = getattr(image, "n_frames", 1)
+            for frame_index in range(frame_count):
+                image.seek(frame_index)
+                durations.append(max(20, int(image.info.get("duration", 100) or 100)))
+            self.images[index] = image
+            self.durations[index] = durations or [100]
+            self.total_durations[index] = sum(self.durations[index])
+        except Exception:
+            try:
+                image.close()
+            except Exception:
+                pass
+            self.images[index] = None
+
+    def reload(self):
+        for index in range(5):
+            self.reload_slot(index)
+
+    def _frame_index(self, index, now):
+        durations = self.durations[index]
+        if len(durations) <= 1:
+            return 0
+        elapsed = int((now - self.started[index]) * 1000) % self.total_durations[index]
+        for frame_index, duration in enumerate(durations):
+            if elapsed < duration:
+                return frame_index
+            elapsed -= duration
+        return 0
+
+    def _upload(self, index, frame):
+        """Transmit PNG bytes in protocol-sized chunks without placing them."""
+        image_id = self.image_ids[index]
+        # Replacing the pixels for a known ID requires deleting its old data.
+        self._send(f"a=d,d=I,i={image_id},q=2")
+        buffer = io.BytesIO()
+        frame.save(buffer, format="PNG", optimize=True)
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        chunks = [encoded[offset:offset + 4096] for offset in range(0, len(encoded), 4096)]
+        for chunk_index, chunk in enumerate(chunks):
+            more = int(chunk_index < len(chunks) - 1)
+            if chunk_index == 0:
+                self._send(
+                    f"a=t,f=100,t=d,i={image_id},q=2,m={more}", chunk
+                )
+            else:
+                self._send(f"m={more},q=2", chunk)
+
+    def mouse(self, key, cols, lines):
+        """Handle clicks and held-button motion over a decoration."""
+        match = re.fullmatch(r"\x1b\[<(\d+);(\d+);(\d+)([mM])", key)
+        if not match:
+            return False
+        button, x, y, event = match.groups()
+        button, x, y = int(button), int(x), int(y)
+
+        if event == "m":
+            was_dragging = self.dragging is not None
+            self.dragging = None
+            if self.drag_dirty:
+                save_settings()
+                self.drag_dirty = False
+            return was_dragging
+
+        if button == 0 and event == "M":
+            for index, item in enumerate(SETTINGS["decorations"]):
+                if self.images[index] is None:
+                    continue
+                if (item["x"] <= x < item["x"] + item["width"] and
+                        item["y"] <= y < item["y"] + item["height"]):
+                    self.dragging = index
+                    self.drag_offset = (x - item["x"], y - item["y"])
+                    self.drag_dirty = False
+                    return True
+            return False
+
+        # SGR button 32 is motion while the left mouse button is held.
+        if button == 32 and self.dragging is not None:
+            item = SETTINGS["decorations"][self.dragging]
+            new_x = max(1, min(max(1, cols - item["width"] + 1), x - self.drag_offset[0]))
+            new_y = max(1, min(max(1, lines - item["height"] + 1), y - self.drag_offset[1]))
+            if (new_x, new_y) != (item["x"], item["y"]):
+                item["x"], item["y"] = new_x, new_y
+                self.drag_dirty = True
+            return True
+        return False
+
+    def draw(self, cols, lines):
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        sys.stdout.write("\x1b7")  # Save cursor while placing graphics.
+        for index, item in enumerate(SETTINGS["decorations"]):
+            image = self.images[index]
+            if image is None:
+                continue
+            width = min(item["width"], cols - item["x"] + 1)
+            height = min(item["height"], lines - item["y"] + 1)
+            if width < 2 or height < 2:
+                continue
+            try:
+                frame_index = self._frame_index(index, now)
+                key = (frame_index, width, height)
+                if self.uploaded[index] != key:
+                    image.seek(frame_index)
+                    resampling = getattr(Image, "Resampling", Image).LANCZOS
+                    frame = image.convert("RGBA").resize(
+                        (width * 9, height * 18), resampling
+                    )
+                    self._upload(index, frame)
+                    self.uploaded[index] = key
+
+                item_x, item_y = item["x"], item["y"]
+                sys.stdout.write(f"\x1b[{item_y};{item_x}H")
+                self._send(
+                    f"a=p,i={self.image_ids[index]},p={self.placement_ids[index]},"
+                    f"c={width},r={height},q=2"
+                )
+            except Exception:
+                continue
+        sys.stdout.write("\x1b8")  # Restore cursor position.
+
+    def invalidate(self):
+        """Force image data to be retransmitted after a full-screen clear."""
+        self.uploaded = [None] * 5
+
+    def clear(self):
+        if self.enabled:
+            for image_id in self.image_ids:
+                self._send(f"a=d,d=I,i={image_id},q=2")
+
+
+def decoration_menu(slot_index, renderer):
+    """Edit one decoration's image and dimensions."""
+    selected = 0
+    message = ""
+    rows = ["Choose / replace image", "Width", "Height", "Remove image", "Back"]
+    while True:
+        item = SETTINGS["decorations"][slot_index]
+        filename = os.path.basename(item["path"]) if item["path"] else "Not set"
+        if len(filename) > 30:
+            filename = filename[:27] + "..."
+        values = [filename, f"{item['width']} cells", f"{item['height']} cells", "Press Enter", "Press Enter"]
+        out = [
+            "\x1b[2J\x1b[H\x1b[1;36m A R T C A V A / DECORATION " + str(slot_index + 1) + "\x1b[0m\n\n",
+            " Choose an image or GIF, then drag it on the main screen to move it.\n\n",
+        ]
+        for row_index, label in enumerate(rows):
+            marker = "\x1b[1;36m ❯ " if row_index == selected else "   "
+            end = "\x1b[0m" if row_index == selected else ""
+            out.append(f"{marker}{label:<24} {values[row_index]:>30}{end}\n")
+        if message:
+            out.append("\n " + message + "\n")
+        if not renderer.enabled:
+            out.append("\n Images display only in Kitty terminal.\n")
+        out.append("\n ↑/↓ select   ←/→ resize   Enter choose   Esc back\n")
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
+        for key in read_keys():
+            if key in UP:
+                selected = (selected - 1) % len(rows)
+                message = ""
+            elif key in DOWN:
+                selected = (selected + 1) % len(rows)
+                message = ""
+            elif selected in (1, 2) and (key in RIGHT or key in LEFT or key in ("+", "-")):
+                direction = -1 if key in LEFT or key == "-" else 1
+                dimension = "width" if selected == 1 else "height"
+                limit = (2, 80) if dimension == "width" else (2, 50)
+                item[dimension] = max(limit[0], min(limit[1], item[dimension] + direction))
+                save_settings()
+                message = f"Decoration {dimension} updated."
+            elif key in ("\r", "\n", "+", "="):
+                if selected == 0:
+                    path = choose_decoration_file()
+                    if path:
+                        try:
+                            with Image.open(path) as test_image:
+                                test_image.verify()
+                            item["path"] = path
+                            renderer.reload_slot(slot_index)
+                            save_settings()
+                            message = "Image loaded. Drag it on the main screen to position it."
+                        except Exception as exc:
+                            message = f"Couldn't load that image: {exc}"
+                    else:
+                        message = "File picker cancelled or unavailable. Install zenity or kdialog."
+                elif selected == 1:
+                    item["width"] = min(80, item["width"] + 1)
+                    save_settings()
+                elif selected == 2:
+                    item["height"] = min(50, item["height"] + 1)
+                    save_settings()
+                elif selected == 3:
+                    item["path"] = ""
+                    renderer.reload_slot(slot_index)
+                    save_settings()
+                    message = "Decoration removed."
+                else:
+                    save_settings()
+                    return
+            elif key in ("\x1b", "s", "S", "q", "Q"):
+                save_settings()
+                return
 
 
 # --------------------------------------------------------------- keyboard --
@@ -456,34 +761,24 @@ def update_notice_mouse_action(key, cols, lines):
 
 
 # --------------------------------------------------------------- menu --
-def settings_menu(update_checker=None, update_ui_state=None):
-    """Display and edit Artcava's settings."""
+def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer=None):
+    """Display and edit Artcava's settings, including five decoration slots."""
     rows = [
-        "Color theme",
-        "Visualization",
-        "Bar width",
-        "Bar spacing",
-        "Sensitivity",
-        "Bar smoothing",
-        "Beat flash",
-        "Lyrics",
-        "Lyrics timing",
-        "Song title",
-        "Opacity",
-        "Check for updates",
+        "Color theme", "Visualization", "Bar width", "Bar spacing",
+        "Sensitivity", "Bar smoothing", "Beat flash", "Lyrics",
+        "Lyrics timing", "Song title", "Opacity",
+        "Decoration slot 1", "Decoration slot 2", "Decoration slot 3",
+        "Decoration slot 4", "Decoration slot 5", "Check for updates",
     ]
-
     selected = 0
     color_names = list(COLOR_PRESETS)
-    help_text = "↑/↓ select   ←/→ change   Enter select/check   S/Esc close"
+    help_text = "↑/↓ select   ←/→ change   Enter open/select   S/Esc close"
     update_prompt = False
 
     def value_for(i):
-        return [
-            SETTINGS["color_mode"],
-            SETTINGS["visualization"],
-            str(SETTINGS["bar_width"]),
-            str(SETTINGS["gap"]),
+        values = [
+            SETTINGS["color_mode"], SETTINGS["visualization"],
+            str(SETTINGS["bar_width"]), str(SETTINGS["gap"]),
             f'{SETTINGS["sensitivity"]:.1f}x',
             f'{SETTINGS["release_time"]:.2f}s',
             f'{SETTINGS["beat_flash"]:.2f}',
@@ -491,48 +786,38 @@ def settings_menu(update_checker=None, update_ui_state=None):
             f'{SETTINGS["lyrics_offset"]:+.2f}s',
             "On" if SETTINGS["show_title"] else "Off",
             f'{SETTINGS["opacity"]:.2f}',
-            "Press Enter",
-        ][i]
+        ]
+        for decoration in SETTINGS["decorations"]:
+            path = decoration["path"]
+            values.append(os.path.basename(path)[:14] if path else "Empty")
+        values.append("Press Enter")
+        return values[i]
 
     def change(direction):
         if selected == 0:
             idx = color_names.index(SETTINGS["color_mode"])
-            SETTINGS["color_mode"] = color_names[
-                (idx + direction) % len(color_names)
-            ]
+            SETTINGS["color_mode"] = color_names[(idx + direction) % len(color_names)]
         elif selected == 1:
             idx = VISUALIZATIONS.index(SETTINGS["visualization"])
-            SETTINGS["visualization"] = VISUALIZATIONS[
-                (idx + direction) % len(VISUALIZATIONS)
-            ]
+            SETTINGS["visualization"] = VISUALIZATIONS[(idx + direction) % len(VISUALIZATIONS)]
         elif selected == 2:
             SETTINGS["bar_width"] = max(1, min(4, SETTINGS["bar_width"] + direction))
         elif selected == 3:
             SETTINGS["gap"] = max(0, min(4, SETTINGS["gap"] + direction))
         elif selected == 4:
-            SETTINGS["sensitivity"] = round(
-                max(0.5, min(2.5, SETTINGS["sensitivity"] + direction * 0.1)), 1
-            )
+            SETTINGS["sensitivity"] = round(max(0.5, min(2.5, SETTINGS["sensitivity"] + direction * 0.1)), 1)
         elif selected == 5:
-            SETTINGS["release_time"] = round(
-                max(0.06, min(0.5, SETTINGS["release_time"] + direction * 0.02)), 2
-            )
+            SETTINGS["release_time"] = round(max(0.06, min(0.5, SETTINGS["release_time"] + direction * 0.02)), 2)
         elif selected == 6:
-            SETTINGS["beat_flash"] = round(
-                max(0.0, min(1.0, SETTINGS["beat_flash"] + direction * 0.05)), 2
-            )
+            SETTINGS["beat_flash"] = round(max(0.0, min(1.0, SETTINGS["beat_flash"] + direction * 0.05)), 2)
         elif selected == 7:
             SETTINGS["lyrics"] = not SETTINGS["lyrics"]
         elif selected == 8:
-            SETTINGS["lyrics_offset"] = round(
-                max(-5.0, min(5.0, SETTINGS["lyrics_offset"] + direction * 0.25)), 2
-            )
+            SETTINGS["lyrics_offset"] = round(max(-5.0, min(5.0, SETTINGS["lyrics_offset"] + direction * 0.25)), 2)
         elif selected == 9:
             SETTINGS["show_title"] = not SETTINGS["show_title"]
         elif selected == 10:
-            new_value = round(
-                max(0.10, min(1.0, SETTINGS["opacity"] + direction * 0.05)), 2
-            )
+            new_value = round(max(0.10, min(1.0, SETTINGS["opacity"] + direction * 0.05)), 2)
             SETTINGS["opacity"] = new_value
             if not kitty_opacity(new_value):
                 return "Kitty opacity unavailable - check Kitty remote-control settings"
@@ -543,13 +828,12 @@ def settings_menu(update_checker=None, update_ui_state=None):
     while True:
         out = [
             "\x1b[2J\x1b[H\x1b[1;36m A R T C A V A / S E T T I N G S\x1b[0m\n\n",
-            " Navigate with arrow keys. Changes apply immediately.\n\n",
+            " Navigate with arrow keys. Decoration slots open their own settings.\n\n",
         ]
         for i, label in enumerate(rows):
             marker = "\x1b[1;36m ❯ " if i == selected else "   "
             end = "\x1b[0m" if i == selected else ""
             out.append(f"{marker}{label:<22} {value_for(i):>14}{end}\n")
-
         if message:
             out.append(f"\n {message}\n")
         if update_prompt:
@@ -578,6 +862,12 @@ def settings_menu(update_checker=None, update_ui_state=None):
             elif key in DOWN:
                 selected = (selected + 1) % len(rows)
                 message = ""
+            elif 11 <= selected <= 15 and key in ("\r", "\n"):
+                if decoration_renderer is None:
+                    message = "Decoration renderer is unavailable."
+                else:
+                    decoration_menu(selected - 11, decoration_renderer)
+                    message = f"Decoration slot {selected - 10} settings closed."
             elif selected == len(rows) - 1 and key in ("\r", "\n"):
                 if update_checker is None:
                     message = "Update checker is unavailable."
@@ -1221,7 +1511,7 @@ def render(vals, colors, rows, pulse, status="", extra=None, header=None):
         lines.extend(extra)
     if status:
         lines.append(status + "\x1b[0m\x1b[K")
-    return "\x1b[H" + "\n".join(lines) + "\x1b[J"
+    return "\x1b[H" + "\n".join(lines)
 
 
 
@@ -1239,6 +1529,7 @@ def main():
         )
 
     load_settings()
+    decoration_renderer = DecorationRenderer()
     original_opacity = kitty_configured_opacity()
     in_kitty = kitty_available()
 
@@ -1280,7 +1571,7 @@ def main():
         kitty_opacity(SETTINGS["opacity"])
 
     sys.stdout.write(
-        "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[2J"
+        "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1003h\x1b[?1006h\x1b[2J"
     )
     sys.stdout.flush()
 
@@ -1315,6 +1606,9 @@ def main():
                     action_message_until = time.monotonic() + 4.0
                     continue
 
+                if decoration_renderer.mouse(key, cols, lines):
+                    continue
+
                 action = mouse_action(key, cols)
                 if action:
                     player_control(action)
@@ -1329,7 +1623,8 @@ def main():
                     player_control("play-pause")
                     continue
                 if key in ("s", "S"):
-                    settings_menu(update_checker, update_ui_state)
+                    settings_menu(update_checker, update_ui_state, decoration_renderer)
+                    decoration_renderer.invalidate()
                     size = None
                     next_t = last = time.perf_counter()
                     break
@@ -1340,10 +1635,12 @@ def main():
                     SETTINGS["lyrics"] = not SETTINGS["lyrics"]
                     save_settings()
                     sys.stdout.write("\x1b[2J")
+                    decoration_renderer.invalidate()
                 elif key in ("t", "T"):
                     SETTINGS["show_title"] = not SETTINGS["show_title"]
                     save_settings()
                     sys.stdout.write("\x1b[2J")
+                    decoration_renderer.invalidate()
                 elif key in ("[", "]"):
                     step = -0.25 if key == "[" else 0.25
                     SETTINGS["lyrics_offset"] = round(
@@ -1364,6 +1661,7 @@ def main():
                 analyzer = Analyzer(nbars)
                 current = gradient(active_palette(watcher.palette), nbars)
                 sys.stdout.write("\x1b[2J")
+                decoration_renderer.invalidate()
 
             target = gradient(active_palette(watcher.palette), analyzer.nbars)
             color_ease = 1.0 - np.exp(-dt / COLOR_EASE_TIME)
@@ -1400,6 +1698,7 @@ def main():
                 frame += update_notice_overlay(cols, lines)
 
             sys.stdout.write(frame)
+            decoration_renderer.draw(cols, lines)
             sys.stdout.flush()
 
             next_t += 1 / FPS
@@ -1416,11 +1715,13 @@ def main():
             reader.proc.terminate()
         except Exception:
             pass
+        save_settings()
+        decoration_renderer.clear()
         if in_kitty:
             restore_kitty_opacity(original_opacity)
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_tty)
         sys.stdout.write(
-            "\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l"
+            "\x1b[?1006l\x1b[?1003l\x1b[?1000l\x1b[?25h\x1b[?1049l"
         )
         sys.stdout.flush()
 
