@@ -48,6 +48,7 @@ RATE = 44100
 FFT_SIZE = 2048
 N_FFT = 4096
 FPS = 60
+DECORATION_FPS = 4.0  # GIFs are deliberately secondary to lyrics and the visualizer.
 FREQ_LO, FREQ_HI = 40, 12000
 BAR_W, GAP = 2, 1
 ATTACK_TIME = 0.028
@@ -266,7 +267,12 @@ def choose_decoration_file():
 
 
 class DecorationRenderer:
-    """Display five still images or GIFs using Kitty's graphics protocol."""
+    """Render decorations in a low-priority worker, outside the 60 FPS loop.
+
+    The main thread owns lyric timing and text rendering. This worker handles
+    GIF frame selection, image resizing, PNG encoding, and Kitty transmission
+    at DECORATION_FPS. Image work therefore cannot stall lyric updates.
+    """
 
     def __init__(self):
         self.enabled = kitty_available()
@@ -280,16 +286,27 @@ class DecorationRenderer:
         self.total_durations = [100] * 5
         self.started = [time.monotonic()] * 5
         self.uploaded = [None] * 5
+        self.placed = [None] * 5
         self.dragging = None
         self.drag_offset = (0, 0)
         self.drag_dirty = False
+
+        # The worker's lock protects Pillow image objects while they are being
+        # read/encoded. The output lock keeps Kitty's multi-chunk graphics
+        # sequence together and prevents it interleaving with a text frame.
+        self._work_lock = threading.RLock()
+        self.output_lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._paused_event = threading.Event()
+        self._worker = None
         self.reload()
 
     @staticmethod
-    def _send(control, payload=""):
-        sys.stdout.write("\x1b_G" + control + (";" + payload if payload else "") + "\x1b\\")
+    def _command(control, payload=""):
+        return "\x1b_G" + control + (";" + payload if payload else "") + "\x1b\\"
 
     def reload_slot(self, index):
+        # Called at startup or while the Settings screen has paused the worker.
         old = self.images[index]
         if old is not None:
             try:
@@ -300,6 +317,7 @@ class DecorationRenderer:
         self.durations[index] = []
         self.total_durations[index] = 100
         self.uploaded[index] = None
+        self.placed[index] = None
         self.started[index] = time.monotonic()
         path = SETTINGS["decorations"][index].get("path", "")
         if not path or not os.path.isfile(path):
@@ -336,23 +354,116 @@ class DecorationRenderer:
             elapsed -= duration
         return 0
 
-    def _upload(self, index, frame):
-        """Transmit PNG bytes in protocol-sized chunks without placing them."""
+    def _upload_commands(self, index, frame):
+        """Build a Kitty image-transmission sequence without writing it yet."""
         image_id = self.image_ids[index]
-        # Replacing the pixels for a known ID requires deleting its old data.
-        self._send(f"a=d,d=I,i={image_id},q=2")
+        output = [self._command(f"a=d,d=I,i={image_id},q=2")]
         buffer = io.BytesIO()
-        frame.save(buffer, format="PNG", optimize=True)
+        # Fast compression and bilinear scaling keep low-priority GIF work cheap.
+        frame.save(buffer, format="PNG", optimize=False, compress_level=1)
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
         chunks = [encoded[offset:offset + 4096] for offset in range(0, len(encoded), 4096)]
         for chunk_index, chunk in enumerate(chunks):
             more = int(chunk_index < len(chunks) - 1)
             if chunk_index == 0:
-                self._send(
+                output.append(self._command(
                     f"a=t,f=100,t=d,i={image_id},q=2,m={more}", chunk
-                )
+                ))
             else:
-                self._send(f"m={more},q=2", chunk)
+                output.append(self._command(f"m={more},q=2", chunk))
+        return "".join(output)
+
+    def _build_output(self, cols, lines):
+        """Prepare only changed frames/placements; called by the worker thread."""
+        now = time.monotonic()
+        output = []
+        cursor_saved = False
+        resampling = getattr(Image, "Resampling", Image).BILINEAR
+
+        for index, item in enumerate(SETTINGS["decorations"]):
+            image = self.images[index]
+            if image is None:
+                continue
+
+            width = min(item["width"], cols - item["x"] + 1)
+            height = min(item["height"], lines - item["y"] + 1)
+            if width < 2 or height < 2:
+                continue
+
+            try:
+                frame_index = self._frame_index(index, now)
+                image_key = (frame_index, width, height)
+                if self.uploaded[index] != image_key:
+                    image.seek(frame_index)
+                    frame = image.convert("RGBA").resize(
+                        (width * 9, height * 18), resampling
+                    )
+                    output.append(self._upload_commands(index, frame))
+                    self.uploaded[index] = image_key
+                    # Replacing Kitty image data may remove its old placement.
+                    self.placed[index] = None
+
+                placement_key = (item["x"], item["y"], width, height)
+                if self.placed[index] != placement_key:
+                    if not cursor_saved:
+                        output.append("\x1b7")
+                        cursor_saved = True
+                    output.append(f"\x1b[{item['y']};{item['x']}H")
+                    output.append(self._command(
+                        f"a=p,i={self.image_ids[index]},p={self.placement_ids[index]},"
+                        f"c={width},r={height},q=2"
+                    ))
+                    self.placed[index] = placement_key
+            except Exception:
+                continue
+
+        if cursor_saved:
+            output.append("\x1b8")
+        return "".join(output)
+
+    def _worker_loop(self):
+        interval = 1.0 / DECORATION_FPS
+        while not self._stop_event.is_set():
+            started = time.monotonic()
+            if not self._paused_event.is_set():
+                try:
+                    with self._work_lock:
+                        if not self._paused_event.is_set():
+                            cols, lines = shutil.get_terminal_size(fallback=(80, 24))
+                            payload = self._build_output(cols, lines)
+                            if payload and not self._paused_event.is_set():
+                                with self.output_lock:
+                                    if not self._paused_event.is_set() and not self._stop_event.is_set():
+                                        sys.stdout.write(payload)
+                                        sys.stdout.flush()
+                except Exception:
+                    # Decorations are optional; a bad image or terminal response
+                    # must never take down the lyrics/visualizer loop.
+                    pass
+            remaining = interval - (time.monotonic() - started)
+            self._stop_event.wait(max(0.0, remaining))
+
+    def start(self):
+        if not self.enabled or (self._worker is not None and self._worker.is_alive()):
+            return
+        self._stop_event.clear()
+        self._worker = threading.Thread(
+            target=self._worker_loop, name="ArtcavaDecorations", daemon=True
+        )
+        self._worker.start()
+
+    def pause(self):
+        """Stop graphics writes completely while the interactive menu is open."""
+        self._paused_event.set()
+        # Wait for any in-progress image processing/transmission to finish.
+        with self._work_lock:
+            pass
+        with self.output_lock:
+            pass
+
+    def resume(self):
+        self.invalidate()
+        self._paused_event.clear()
 
     def mouse(self, key, cols, lines):
         """Handle clicks and held-button motion over a decoration."""
@@ -389,53 +500,33 @@ class DecorationRenderer:
             new_y = max(1, min(max(1, lines - item["height"] + 1), y - self.drag_offset[1]))
             if (new_x, new_y) != (item["x"], item["y"]):
                 item["x"], item["y"] = new_x, new_y
+                self.placed[self.dragging] = None
                 self.drag_dirty = True
             return True
         return False
 
-    def draw(self, cols, lines):
-        if not self.enabled:
-            return
-        now = time.monotonic()
-        sys.stdout.write("\x1b7")  # Save cursor while placing graphics.
-        for index, item in enumerate(SETTINGS["decorations"]):
-            image = self.images[index]
-            if image is None:
-                continue
-            width = min(item["width"], cols - item["x"] + 1)
-            height = min(item["height"], lines - item["y"] + 1)
-            if width < 2 or height < 2:
-                continue
-            try:
-                frame_index = self._frame_index(index, now)
-                key = (frame_index, width, height)
-                if self.uploaded[index] != key:
-                    image.seek(frame_index)
-                    resampling = getattr(Image, "Resampling", Image).LANCZOS
-                    frame = image.convert("RGBA").resize(
-                        (width * 9, height * 18), resampling
-                    )
-                    self._upload(index, frame)
-                    self.uploaded[index] = key
-
-                item_x, item_y = item["x"], item["y"]
-                sys.stdout.write(f"\x1b[{item_y};{item_x}H")
-                self._send(
-                    f"a=p,i={self.image_ids[index]},p={self.placement_ids[index]},"
-                    f"c={width},r={height},q=2"
-                )
-            except Exception:
-                continue
-        sys.stdout.write("\x1b8")  # Restore cursor position.
-
     def invalidate(self):
-        """Force image data to be retransmitted after a full-screen clear."""
+        """Force images and placements to be redrawn after clearing the screen."""
         self.uploaded = [None] * 5
+        self.placed = [None] * 5
+
+    def stop(self):
+        self._stop_event.set()
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=3)
+        self._worker = None
 
     def clear(self):
-        if self.enabled:
-            for image_id in self.image_ids:
-                self._send(f"a=d,d=I,i={image_id},q=2")
+        if not self.enabled:
+            return
+        commands = "".join(
+            self._command(f"a=d,d=I,i={image_id},q=2")
+            for image_id in self.image_ids
+        )
+        with self.output_lock:
+            sys.stdout.write(commands)
+            sys.stdout.flush()
 
 
 def decoration_menu(slot_index, renderer):
@@ -1574,6 +1665,7 @@ def main():
         "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1003h\x1b[?1006h\x1b[2J"
     )
     sys.stdout.flush()
+    decoration_renderer.start()
 
     try:
         while not quit_requested:
@@ -1623,8 +1715,11 @@ def main():
                     player_control("play-pause")
                     continue
                 if key in ("s", "S"):
-                    settings_menu(update_checker, update_ui_state, decoration_renderer)
-                    decoration_renderer.invalidate()
+                    decoration_renderer.pause()
+                    try:
+                        settings_menu(update_checker, update_ui_state, decoration_renderer)
+                    finally:
+                        decoration_renderer.resume()
                     size = None
                     next_t = last = time.perf_counter()
                     break
@@ -1697,9 +1792,9 @@ def main():
             elif update_checker.snapshot()[1] and not update_ui_state["dismissed"]:
                 frame += update_notice_overlay(cols, lines)
 
-            sys.stdout.write(frame)
-            decoration_renderer.draw(cols, lines)
-            sys.stdout.flush()
+            with decoration_renderer.output_lock:
+                sys.stdout.write(frame)
+                sys.stdout.flush()
 
             next_t += 1 / FPS
             spare = next_t - time.perf_counter()
@@ -1716,6 +1811,7 @@ def main():
         except Exception:
             pass
         save_settings()
+        decoration_renderer.stop()
         decoration_renderer.clear()
         if in_kitty:
             restore_kitty_opacity(original_opacity)
