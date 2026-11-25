@@ -515,14 +515,6 @@ def decoration_menu(slot_index, renderer):
 
 
 # --------------------------------------------------------------- keyboard --
-KEY_RE = re.compile(
-    r"\x1b\[<\d+;\d+;\d+[mM]|"
-    r"\x1b\[[0-9;]*[A-Za-z~]|"
-    r"\x1bO[A-Za-z]|"
-    r"\x1b|.",
-    re.S,
-)
-
 UP, DOWN = ("\x1b[A", "\x1bOA"), ("\x1b[B", "\x1bOB")
 RIGHT, LEFT = ("\x1b[C", "\x1bOC"), ("\x1b[D", "\x1bOD")
 CONTROLS = "[<<] [||] [>>]"
@@ -563,15 +555,97 @@ def mouse_action(key, cols):
     return None
 
 
-def read_keys(timeout=None):
-    fd = sys.stdin.fileno()
-    if timeout is not None and not select.select([fd], [], [], timeout)[0]:
-        return []
+# Terminal input arrives as a byte stream, so a single key or mouse report
+# can be split across separate os.read() calls. Keep incomplete CSI sequences
+# buffered; otherwise the '[' inside a split mouse report can be mistaken for
+# the lyric-timing shortcut and silently change lyrics_offset.
+_KEY_BUFFER = ""
+_KEY_BUFFER_UPDATED = 0.0
+_KEY_SEQUENCE_TIMEOUT = 0.10
 
-    data = os.read(fd, 64)
-    if not data:
-        raise EOFError
-    return KEY_RE.findall(data.decode("utf-8", "ignore"))
+
+def _extract_key_tokens(force_expired=False):
+    """Extract complete input events without leaking pieces of escape sequences."""
+    global _KEY_BUFFER
+    keys = []
+
+    while _KEY_BUFFER:
+        if _KEY_BUFFER[0] != "\x1b":
+            keys.append(_KEY_BUFFER[0])
+            _KEY_BUFFER = _KEY_BUFFER[1:]
+            continue
+
+        # An Escape key by itself is ambiguous until the short sequence window
+        # passes, because arrow and mouse events also begin with ESC.
+        if len(_KEY_BUFFER) == 1:
+            if force_expired:
+                keys.append("\x1b")
+                _KEY_BUFFER = ""
+            break
+
+        introducer = _KEY_BUFFER[1]
+        if introducer == "[":
+            # CSI final bytes are 0x40-0x7e. This covers arrows and SGR mouse
+            # reports such as ESC[<32;column;rowM, including split reports.
+            final_index = next(
+                (i for i in range(2, len(_KEY_BUFFER))
+                 if 0x40 <= ord(_KEY_BUFFER[i]) <= 0x7E),
+                None,
+            )
+            if final_index is not None:
+                keys.append(_KEY_BUFFER[:final_index + 1])
+                _KEY_BUFFER = _KEY_BUFFER[final_index + 1:]
+                continue
+            if force_expired:
+                # Discard an incomplete control sequence as a whole. Never
+                # send its '[' or parameter characters to the normal key path.
+                _KEY_BUFFER = ""
+            break
+
+        if introducer == "O":
+            if len(_KEY_BUFFER) >= 3:
+                keys.append(_KEY_BUFFER[:3])
+                _KEY_BUFFER = _KEY_BUFFER[3:]
+                continue
+            if force_expired:
+                _KEY_BUFFER = ""
+            break
+
+        # ESC followed by an ordinary character: emit Escape, then parse the
+        # character normally (for example, Escape followed by S).
+        keys.append("\x1b")
+        _KEY_BUFFER = _KEY_BUFFER[1:]
+
+    return keys
+
+
+def read_keys(timeout=None):
+    """Read complete keyboard/mouse events while retaining partial reports."""
+    global _KEY_BUFFER, _KEY_BUFFER_UPDATED
+    fd = sys.stdin.fileno()
+
+    wait = timeout
+    if wait is None and _KEY_BUFFER.startswith("\x1b"):
+        elapsed = time.monotonic() - _KEY_BUFFER_UPDATED
+        wait = max(0.0, _KEY_SEQUENCE_TIMEOUT - elapsed)
+
+    ready = select.select([fd], [], [], wait)[0]
+    if ready:
+        # Read a larger chunk so bursts of SGR mouse reports are less likely
+        # to be split, while still handling splits safely in _extract_key_tokens.
+        data = os.read(fd, 4096)
+        if not data:
+            raise EOFError
+        decoded = data.decode("utf-8", "ignore")
+        if decoded:
+            _KEY_BUFFER += decoded
+            _KEY_BUFFER_UPDATED = time.monotonic()
+
+    expired = (
+        _KEY_BUFFER.startswith("\x1b")
+        and time.monotonic() - _KEY_BUFFER_UPDATED >= _KEY_SEQUENCE_TIMEOUT
+    )
+    return _extract_key_tokens(force_expired=expired)
 
 
 # --------------------------------------------------------------- updates --
@@ -1576,7 +1650,7 @@ def main():
         kitty_opacity(SETTINGS["opacity"])
 
     sys.stdout.write(
-        "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1003h\x1b[?1006h\x1b[2J"
+        "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[2J"
     )
     sys.stdout.flush()
 
@@ -1726,7 +1800,7 @@ def main():
             restore_kitty_opacity(original_opacity)
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_tty)
         sys.stdout.write(
-            "\x1b[?1006l\x1b[?1003l\x1b[?1000l\x1b[?25h\x1b[?1049l"
+            "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l"
         )
         sys.stdout.flush()
 
