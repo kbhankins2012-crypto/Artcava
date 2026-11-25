@@ -35,7 +35,6 @@ Designed for the **Kitty terminal**.
 - **Automatic update checker:** Checks GitHub for newer versions in the background when Artcava launches.
 - **Update notifications:** Displays a small notification when an update is available, with options to update or dismiss it.
 - **Quick update access:** Opens the GitHub README and copies the link so users can access the Quick Install command.
-- **Decorations** Add up to five custom images or animated GIFs, then resize and drag them anywhere around your visualizer.
 
 ### Additional Controls
 
