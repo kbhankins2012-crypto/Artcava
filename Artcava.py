@@ -1300,6 +1300,12 @@ class LyricsWatcher(threading.Thread):
 
         key = (artist, title, album, round(length))
         if key != self.key:
+            # Lyric timing adjustments are useful while tuning one track, but
+            # an old negative offset should not carry over and delay every new
+            # song. Start each newly detected track at the neutral setting.
+            if SETTINGS["lyrics_offset"] != DEFAULTS["lyrics_offset"]:
+                SETTINGS["lyrics_offset"] = DEFAULTS["lyrics_offset"]
+                save_settings()
             self.key = key
             self.data = ("loading", [], [])
             text = load_lyrics(artist, title, album, length)
