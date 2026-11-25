@@ -87,6 +87,7 @@ DEFAULTS = {
     "release_time": RELEASE_TIME,
     "beat_flash": BEAT_FLASH,
     "lyrics": True,
+    # User-selected global sync adjustment. Persist across tracks and launches.
     "lyrics_offset": 0.0,
     "show_title": True,
     "opacity": 1.0,
@@ -1300,12 +1301,10 @@ class LyricsWatcher(threading.Thread):
 
         key = (artist, title, album, round(length))
         if key != self.key:
-            # Lyric timing adjustments are useful while tuning one track, but
-            # an old negative offset should not carry over and delay every new
-            # song. Start each newly detected track at the neutral setting.
-            if SETTINGS["lyrics_offset"] != DEFAULTS["lyrics_offset"]:
-                SETTINGS["lyrics_offset"] = DEFAULTS["lyrics_offset"]
-                save_settings()
+            # IMPORTANT: lyrics_offset is a user preference, not per-track
+            # state. Never reset or modify it when the song changes. The value
+            # is loaded from settings.json and changes only through the user's
+            # Lyrics timing controls; save_settings() persists those changes.
             self.key = key
             self.data = ("loading", [], [])
             text = load_lyrics(artist, title, album, length)
