@@ -12,6 +12,7 @@ Keys  : S = settings   Q = quit   L = lyrics on/off   T = song title on/off
         A = previous track   Space = pause/resume   D = next track
         [ ] = nudge lyric timing
         Mouse drag = move decorations (configure slots in Settings)
+        Water reflection = Settings > Reflection (Bars visualization)
 
 Kitty transparency:
     Add these to ~/.config/kitty/kitty.conf:
@@ -91,6 +92,11 @@ DEFAULTS = {
     "lyrics_offset": 0.0,
     "show_title": True,
     "opacity": 1.0,
+    # Water reflection under the Bars visualization (off unless enabled).
+    "reflection": False,
+    "reflection_strength": 0.55,
+    "reflection_length": 0.50,
+    "water_distortion": 0.35,
 }
 
 DEFAULT_DECORATIONS = [
@@ -112,6 +118,9 @@ LIMITS = [
     ("beat_flash", 0.0, 1.0, float),
     ("lyrics_offset", -5.0, 5.0, float),
     ("opacity", 0.10, 1.0, float),
+    ("reflection_strength", 0.10, 1.0, float),
+    ("reflection_length", 0.20, 1.0, float),
+    ("water_distortion", 0.0, 1.0, float),
 ]
 
 
@@ -138,7 +147,7 @@ def load_settings():
     if SETTINGS.get("visualization") not in VISUALIZATIONS:
         SETTINGS["visualization"] = "Bars"
 
-    for flag in ("lyrics", "show_title"):
+    for flag in ("lyrics", "show_title", "reflection"):
         if not isinstance(SETTINGS[flag], bool):
             SETTINGS[flag] = DEFAULTS[flag]
 
@@ -515,6 +524,14 @@ def decoration_menu(slot_index, renderer):
 
 
 # --------------------------------------------------------------- keyboard --
+KEY_RE = re.compile(
+    r"\x1b\[<\d+;\d+;\d+[mM]|"
+    r"\x1b\[[0-9;]*[A-Za-z~]|"
+    r"\x1bO[A-Za-z]|"
+    r"\x1b|.",
+    re.S,
+)
+
 UP, DOWN = ("\x1b[A", "\x1bOA"), ("\x1b[B", "\x1bOB")
 RIGHT, LEFT = ("\x1b[C", "\x1bOC"), ("\x1b[D", "\x1bOD")
 CONTROLS = "[<<] [||] [>>]"
@@ -555,97 +572,31 @@ def mouse_action(key, cols):
     return None
 
 
-# Terminal input arrives as a byte stream, so a single key or mouse report
-# can be split across separate os.read() calls. Keep incomplete CSI sequences
-# buffered; otherwise the '[' inside a split mouse report can be mistaken for
-# the lyric-timing shortcut and silently change lyrics_offset.
-_KEY_BUFFER = ""
-_KEY_BUFFER_UPDATED = 0.0
-_KEY_SEQUENCE_TIMEOUT = 0.10
-
-
-def _extract_key_tokens(force_expired=False):
-    """Extract complete input events without leaking pieces of escape sequences."""
-    global _KEY_BUFFER
-    keys = []
-
-    while _KEY_BUFFER:
-        if _KEY_BUFFER[0] != "\x1b":
-            keys.append(_KEY_BUFFER[0])
-            _KEY_BUFFER = _KEY_BUFFER[1:]
-            continue
-
-        # An Escape key by itself is ambiguous until the short sequence window
-        # passes, because arrow and mouse events also begin with ESC.
-        if len(_KEY_BUFFER) == 1:
-            if force_expired:
-                keys.append("\x1b")
-                _KEY_BUFFER = ""
-            break
-
-        introducer = _KEY_BUFFER[1]
-        if introducer == "[":
-            # CSI final bytes are 0x40-0x7e. This covers arrows and SGR mouse
-            # reports such as ESC[<32;column;rowM, including split reports.
-            final_index = next(
-                (i for i in range(2, len(_KEY_BUFFER))
-                 if 0x40 <= ord(_KEY_BUFFER[i]) <= 0x7E),
-                None,
-            )
-            if final_index is not None:
-                keys.append(_KEY_BUFFER[:final_index + 1])
-                _KEY_BUFFER = _KEY_BUFFER[final_index + 1:]
-                continue
-            if force_expired:
-                # Discard an incomplete control sequence as a whole. Never
-                # send its '[' or parameter characters to the normal key path.
-                _KEY_BUFFER = ""
-            break
-
-        if introducer == "O":
-            if len(_KEY_BUFFER) >= 3:
-                keys.append(_KEY_BUFFER[:3])
-                _KEY_BUFFER = _KEY_BUFFER[3:]
-                continue
-            if force_expired:
-                _KEY_BUFFER = ""
-            break
-
-        # ESC followed by an ordinary character: emit Escape, then parse the
-        # character normally (for example, Escape followed by S).
-        keys.append("\x1b")
-        _KEY_BUFFER = _KEY_BUFFER[1:]
-
-    return keys
+_pending = ""
+PARTIAL = re.compile(r"\x1b\[[0-9;<]*$")
 
 
 def read_keys(timeout=None):
-    """Read complete keyboard/mouse events while retaining partial reports."""
-    global _KEY_BUFFER, _KEY_BUFFER_UPDATED
+    """Read key and mouse input, keeping any half-received escape sequence for the next call."""
+    global _pending
     fd = sys.stdin.fileno()
+    if timeout is not None and not select.select([fd], [], [], timeout)[0]:
+        return []
 
-    wait = timeout
-    if wait is None and _KEY_BUFFER.startswith("\x1b"):
-        elapsed = time.monotonic() - _KEY_BUFFER_UPDATED
-        wait = max(0.0, _KEY_SEQUENCE_TIMEOUT - elapsed)
-
-    ready = select.select([fd], [], [], wait)[0]
-    if ready:
-        # Read a larger chunk so bursts of SGR mouse reports are less likely
-        # to be split, while still handling splits safely in _extract_key_tokens.
-        data = os.read(fd, 4096)
-        if not data:
-            raise EOFError
-        decoded = data.decode("utf-8", "ignore")
-        if decoded:
-            _KEY_BUFFER += decoded
-            _KEY_BUFFER_UPDATED = time.monotonic()
-
-    expired = (
-        _KEY_BUFFER.startswith("\x1b")
-        and time.monotonic() - _KEY_BUFFER_UPDATED >= _KEY_SEQUENCE_TIMEOUT
-    )
-    return _extract_key_tokens(force_expired=expired)
+    data = os.read(fd, 4096)
+    if not data:
+        raise EOFError
+    text = _pending + data.decode("utf-8", "ignore")
+    _pending = ""
+    if text.endswith("\x1b") and select.select([fd], [], [], 0.02)[0]:
+        # Ends on a lone ESC: either the Esc key or the first byte of a mouse report.
+        # Give the rest of a report a moment to arrive; a real Esc press waits ~20 ms.
+        more = os.read(fd, 4096)
+        text += more.decode("utf-8", "ignore")
+    match = PARTIAL.search(text)
+    if match:                                # report was cut off: keep the rest
+        _pending, text = text[match.start():], text[:match.start()]
+    return KEY_RE.findall(text)
 
 
 # --------------------------------------------------------------- updates --
@@ -842,6 +793,7 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
         "Color theme", "Visualization", "Bar width", "Bar spacing",
         "Sensitivity", "Bar smoothing", "Beat flash", "Lyrics",
         "Lyrics timing", "Song title", "Opacity",
+        "Reflection", "Reflection strength", "Reflection length", "Water distortion",
         "Decoration slot 1", "Decoration slot 2", "Decoration slot 3",
         "Decoration slot 4", "Decoration slot 5", "Check for updates",
     ]
@@ -861,6 +813,10 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
             f'{SETTINGS["lyrics_offset"]:+.2f}s',
             "On" if SETTINGS["show_title"] else "Off",
             f'{SETTINGS["opacity"]:.2f}',
+            "On" if SETTINGS["reflection"] else "Off",
+            f'{SETTINGS["reflection_strength"] * 100:.0f}%',
+            f'{SETTINGS["reflection_length"] * 100:.0f}%',
+            f'{SETTINGS["water_distortion"] * 100:.0f}%',
         ]
         for decoration in SETTINGS["decorations"]:
             path = decoration["path"]
@@ -897,6 +853,16 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
             if not kitty_opacity(new_value):
                 return "Kitty opacity unavailable - check Kitty remote-control settings"
             return "Kitty opacity updated"
+        elif selected == 11:
+            SETTINGS["reflection"] = not SETTINGS["reflection"]
+        elif selected == 12:
+            SETTINGS["reflection_strength"] = round(max(0.1, min(1.0, SETTINGS["reflection_strength"] + direction * 0.05)), 2)
+        elif selected == 13:
+            SETTINGS["reflection_length"] = round(max(0.2, min(1.0, SETTINGS["reflection_length"] + direction * 0.05)), 2)
+        elif selected == 14:
+            SETTINGS["water_distortion"] = round(max(0.0, min(1.0, SETTINGS["water_distortion"] + direction * 0.05)), 2)
+        if 11 <= selected <= 14 and SETTINGS["visualization"] != "Bars":
+            return "The reflection only appears with the Bars visualization."
         return None
 
     message = ""
@@ -905,7 +871,13 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
             "\x1b[2J\x1b[H\x1b[1;36m A R T C A V A / S E T T I N G S\x1b[0m\n\n",
             " Navigate with arrow keys. Decoration slots open their own settings.\n\n",
         ]
-        for i, label in enumerate(rows):
+        # Show only the rows that fit the window, keeping the selected row in view.
+        visible = max(6, shutil.get_terminal_size().lines - 11)
+        first = 0
+        if len(rows) > visible:
+            first = max(0, min(selected - visible // 2, len(rows) - visible))
+        for i in range(first, min(len(rows), first + visible)):
+            label = rows[i]
             marker = "\x1b[1;36m ❯ " if i == selected else "   "
             end = "\x1b[0m" if i == selected else ""
             out.append(f"{marker}{label:<22} {value_for(i):>14}{end}\n")
@@ -937,12 +909,12 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
             elif key in DOWN:
                 selected = (selected + 1) % len(rows)
                 message = ""
-            elif 11 <= selected <= 15 and key in ("\r", "\n"):
+            elif 15 <= selected <= 19 and key in ("\r", "\n"):
                 if decoration_renderer is None:
                     message = "Decoration renderer is unavailable."
                 else:
-                    decoration_menu(selected - 11, decoration_renderer)
-                    message = f"Decoration slot {selected - 10} settings closed."
+                    decoration_menu(selected - 15, decoration_renderer)
+                    message = f"Decoration slot {selected - 14} settings closed."
             elif selected == len(rows) - 1 and key in ("\r", "\n"):
                 if update_checker is None:
                     message = "Update checker is unavailable."
@@ -1579,13 +1551,126 @@ def render_mirror(vals, colors, rows, pulse):
     return output
 
 
+# ------------------------------------------------------------ reflection --
+# Water reflection for the Bars visualization. The bars themselves are still drawn
+# by render_bars() exactly as before; this only adds a faded, gently rippling mirror
+# image in the rows beneath them. It is computed with a handful of numpy operations
+# per frame and draws each row as a few runs of identical cells, so it stays cheap.
+REFLECTION_MIN_ROWS = 8          # shorter bar areas skip the reflection entirely
+REFLECTION_CHARS = " ▔▀█"         # how much of a reflected cell is filled, from the top
+_reflection_layout_cache = {"key": None, "layout": None}
+_color_prefix_cache = {}
+
+
+def reflection_split(rows):
+    """Split the bar area into (bar_rows, reflection_rows), or None if it is too short."""
+    if rows < REFLECTION_MIN_ROWS:
+        return None
+    length = SETTINGS["reflection_length"]
+    reflection_rows = int(round(rows * length / (1.0 + length)))
+    reflection_rows = max(2, min(rows // 2, reflection_rows))
+    return rows - reflection_rows, reflection_rows
+
+
+def _reflection_layout(nbars, width, gap):
+    """Which bar each terminal column belongs to (-1 for gaps); cached per layout."""
+    key = (nbars, width, gap)
+    cache = _reflection_layout_cache
+    if cache["key"] != key:
+        stride = width + gap
+        cols = np.arange(nbars * stride - gap)
+        cache["layout"] = np.where(cols % stride < width, cols // stride, -1)
+        cache["key"] = key
+    return cache["layout"]
+
+
+def _color_prefix(code):
+    prefix = _color_prefix_cache.get(code)
+    if prefix is None:
+        r, g, b = ((code >> 10) & 31) << 3, ((code >> 5) & 31) << 3, (code & 31) << 3
+        prefix = f"\x1b[38;2;{r};{g};{b}m"
+        if len(_color_prefix_cache) < 40000:
+            _color_prefix_cache[code] = prefix
+    return prefix
+
+
+def render_reflection(vals, colors, bar_rows, reflection_rows, pulse):
+    """Return `reflection_rows` lines: a faded, rippling mirror image of the bars."""
+    strength = SETTINGS["reflection_strength"]
+    distortion = SETTINGS["water_distortion"]
+    layout = _reflection_layout(len(vals), SETTINGS["bar_width"], SETTINGS["gap"])
+    ncols = layout.shape[0]
+
+    k = np.arange(reflection_rows)
+    depth = (k + 0.5) / reflection_rows              # 0 at the water line, 1 at the far end
+    fade = strength * (1.0 - depth) ** 1.5           # brightest at the surface, fading with depth
+
+    # Ripple: each reflected row slides sideways by a small, slowly moving amount that
+    # grows with depth, so it is calm at the surface and wobblier further down.
+    if distortion > 0.0:
+        t = time.monotonic()
+        amplitude = distortion * (0.35 + 1.65 * depth)
+        wave = (0.7 * np.sin(6.2832 * (0.23 * k - 0.85 * t))
+                + 0.3 * np.sin(6.2832 * (0.61 * k + 0.50 * t + 0.3)))
+        shift = np.rint(amplitude * wave).astype(np.int64)
+    else:
+        shift = np.zeros(reflection_rows, dtype=np.int64)
+
+    source = np.clip(np.arange(ncols)[None, :] - shift[:, None], 0, ncols - 1)
+    bar_index = layout[source]                       # (rows, columns)
+    solid = bar_index >= 0
+    safe = np.where(solid, bar_index, 0)
+
+    # Same height scale as the real bars, so the reflection mirrors them exactly.
+    heights = np.clip(vals, 0.0, 1.0) * bar_rows
+    cover = np.clip(heights[safe] - k[:, None], 0.0, 1.0) * solid
+    level = ((cover >= 0.0625).astype(np.int64) + (cover >= 0.3125) + (cover >= 0.75))
+    level[fade < 0.03] = 0                           # too faint to be worth drawing
+
+    # Same colors as the bars (album art, presets, beat flash), dimmed by the fade.
+    flash = colors + (255 - colors) * (pulse * SETTINGS["beat_flash"])
+    rgb = np.clip(flash, 0, 255)[safe] * fade[:, None, None]
+    q = rgb.astype(np.int64) >> 3
+    code = (q[..., 0] << 10) | (q[..., 1] << 5) | q[..., 2]
+    key = np.where(level > 0, code * 4 + level, 0)
+
+    lines = []
+    for r in range(reflection_rows):
+        row = key[r]
+        if not row.any():
+            lines.append("\x1b[K")
+            continue
+        cuts = (np.flatnonzero(row[1:] != row[:-1]) + 1).tolist()
+        parts = []
+        start = 0
+        for end in cuts + [ncols]:
+            value = int(row[start])
+            if value == 0:
+                parts.append(" " * (end - start))
+            else:
+                color_code, lvl = divmod(value, 4)
+                parts.append(_color_prefix(color_code) + REFLECTION_CHARS[lvl] * (end - start))
+            start = end
+        lines.append("".join(parts) + "\x1b[0m\x1b[K")
+    return lines
+
+
 def render(vals, colors, rows, pulse, status="", extra=None, header=None):
     """Compose the selected spectrum style with the shared header and lyrics."""
     lines = list(header) if header else []
     if SETTINGS["visualization"] == "Mirror":
         lines.extend(render_mirror(vals, colors, rows, pulse))
     else:
-        lines.extend(render_bars(vals, colors, rows, pulse))
+        split = reflection_split(rows) if SETTINGS["reflection"] else None
+        if split:
+            bar_rows, reflection_rows = split
+            lines.extend(render_bars(vals, colors, bar_rows, pulse))
+            try:
+                lines.extend(render_reflection(vals, colors, bar_rows, reflection_rows, pulse))
+            except Exception:    # a cosmetic effect must never take the visualizer down
+                lines.extend(["\x1b[K"] * reflection_rows)
+        else:
+            lines.extend(render_bars(vals, colors, rows, pulse))
     if extra:
         lines.extend(extra)
     if status:
