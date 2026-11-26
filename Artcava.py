@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Artcava - a terminal music visualizer with album-art colors, synced lyrics,
+Artcava - a terminal music visualizer with album-art colors, synced lyrics
 and interactive playback controls.
 
 Audio : captured from your default output's monitor via `parec`
