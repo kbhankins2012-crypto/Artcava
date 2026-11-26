@@ -13,6 +13,7 @@ Keys  : S = settings   Q = quit   L = lyrics on/off   T = song title on/off
         [ ] = nudge lyric timing
         Mouse drag = move decorations (configure slots in Settings)
         Water reflection = Settings > Reflection (Bars visualization)
+        Click or drag the progress bar = jump to any point in the song
 
 Kitty transparency:
     Add these to ~/.config/kitty/kitty.conf:
@@ -1154,6 +1155,7 @@ USER_AGENT = "Artcava (https://github.com/kbhankins2012-crypto/Artcava)"
 LYRIC_CACHE = os.path.expanduser("~/.cache/artcava/lyrics")
 LYRIC_ROWS = 4
 HEADER_ROWS = 2
+PROGRESS_MAX_WIDTH = 100         # widest the progress bar gets (wider = finer seeking)
 SEP = "\x1f"
 LRC_TAG = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
 LRC_WORD = re.compile(r"<\d+:\d+(?:\.\d+)?>")
@@ -1264,11 +1266,45 @@ class LyricsWatcher(threading.Thread):
         self.playing = False
         self.anchor_pos = 0.0
         self.anchor_t = time.monotonic()
+        self.player = None            # name of the player that is playing (seek target)
+        self.seek_preview = None      # seconds shown while the progress bar is being dragged
+        self.hold_until = 0.0         # ignore polled positions until the player catches up
+        self.seek_failed = False
 
     def position(self):
+        if self.seek_preview is not None:          # dragging: show where the bar is being moved
+            return self.seek_preview
         if self.playing:
             return self.anchor_pos + (time.monotonic() - self.anchor_t)
         return self.anchor_pos
+
+    def seek(self, seconds):
+        """Jump to `seconds` in the current song; playerctl runs in the background."""
+        track = self.track
+        length = float(track[3] or 0.0) if track else 0.0
+        if length > 0:
+            seconds = min(seconds, max(0.0, length - 1.0))      # don't skip past the end
+        seconds = max(0.0, seconds)
+        now = time.monotonic()
+        self.anchor_pos, self.anchor_t = seconds, now           # show the jump immediately
+        self.hold_until = now + 1.2                             # ignore a stale position while the player catches up
+        command = ["playerctl"]
+        if self.player:
+            command.append(f"--player={self.player}")
+        command += ["position", f"{seconds:.2f}"]
+
+        def run():
+            try:
+                result = subprocess.run(command, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL, timeout=3)
+                failed = result.returncode != 0
+            except (OSError, subprocess.TimeoutExpired):
+                failed = True
+            if failed:
+                self.seek_failed = True
+                self.hold_until = 0.0                           # go back to showing the real position
+
+        threading.Thread(target=run, daemon=True).start()
 
     @staticmethod
     def now_playing():
@@ -1325,6 +1361,7 @@ class LyricsWatcher(threading.Thread):
             return
 
         player, status, artist, title, album, length = info
+        self.player = player
         self.track = (
             title,
             album,
@@ -1335,7 +1372,7 @@ class LyricsWatcher(threading.Thread):
         # Keep playback position updated even when synced lyrics are disabled,
         # because the same clock drives the on-screen song progress bar.
         pos = self.read_position(player)
-        if pos is not None:
+        if pos is not None and time.monotonic() >= self.hold_until:
             self.anchor_pos = max(0.0, pos)
             self.anchor_t = time.monotonic()
         self.playing = status == "Playing"
@@ -1407,6 +1444,20 @@ def format_time(seconds):
     return f"{minutes}:{secs:02d}"
 
 
+def progress_layout(cols, elapsed_text, total_text):
+    """Where the progress bar sits on its row: (left_padding, bar_width, first_bar_column).
+
+    Used both to draw the bar and to turn a mouse position into a time, so the two
+    can never disagree. The bar grows with the window (up to PROGRESS_MAX_WIDTH).
+    """
+    fixed_width = text_width(elapsed_text) + text_width(total_text) + 6
+    bar_width = max(6, min(PROGRESS_MAX_WIDTH, int(cols * 0.6), cols - fixed_width - 2))
+    visible_width = text_width(elapsed_text) + 2 + bar_width + 2 + text_width(total_text)
+    left_padding = max(0, (cols - visible_width) // 2)
+    first_column = left_padding + text_width(elapsed_text) + 2 + 1      # 1-based, as the mouse reports
+    return left_padding, bar_width, first_column
+
+
 def progress_line(watcher, cols, accent):
     """Draw a centered, live song progress bar with elapsed and total time."""
     track = watcher.track
@@ -1424,10 +1475,7 @@ def progress_line(watcher, cols, accent):
         total_text = "--:--"
 
     elapsed_text = format_time(position)
-    # Leave room for both timestamps and separators, while keeping the
-    # progress indicator comfortably sized on ordinary terminal widths.
-    fixed_width = text_width(elapsed_text) + text_width(total_text) + 6
-    bar_width = max(6, min(42, cols - fixed_width - 2))
+    left_padding, bar_width, _first_column = progress_layout(cols, elapsed_text, total_text)
     marker = min(bar_width - 1, int(round(fraction * (bar_width - 1))))
     filled = "━" * marker
     remaining = "─" * (bar_width - marker - 1)
@@ -1444,8 +1492,6 @@ def progress_line(watcher, cols, accent):
         + dim + remaining + "  " + total_text
         + "\x1b[0m"
     )
-    visible_width = text_width(elapsed_text) + 2 + bar_width + 2 + text_width(total_text)
-    left_padding = max(0, (cols - visible_width) // 2)
     return " " * left_padding + content + "\x1b[K"
 
 
@@ -1500,6 +1546,81 @@ def lyric_block(watcher, cols, accent):
 
     msg = {"loading": "Searching for lyrics…", "none": "No synced lyrics found"}.get(state, "")
     return ["\x1b[K", "\x1b[K", center(msg, dim), "\x1b[K"]
+
+
+class SeekBar:
+    """Click or drag the progress bar (second header row) to jump within the song.
+
+    Dragging previews the new time (the bar, the clock and the lyrics follow the
+    mouse); letting go sends the seek to the player that is playing.
+    """
+    PROGRESS_ROW = 2
+
+    def __init__(self):
+        self.dragging = False
+        self.bar = (1, 2, 0.0)       # (first column, width, song length), frozen at the start of a drag
+        self.last_event = 0.0
+        self.message = ""
+
+    def _target(self, x):
+        first, width, duration = self.bar
+        fraction = (x - first) / max(1, width - 1)
+        return max(0.0, min(1.0, fraction)) * duration
+
+    def cancel(self, watcher, commit=False):
+        """End a drag; with commit=True, jump to where it was released."""
+        if not self.dragging:
+            return
+        self.dragging = False
+        target = watcher.seek_preview
+        watcher.seek_preview = None
+        if commit and target is not None:
+            watcher.seek(target)
+
+    def tick(self, watcher):
+        """Drop a drag whose button release never arrived (for example after a focus change)."""
+        if self.dragging and time.monotonic() - self.last_event > 5.0:
+            self.cancel(watcher)
+
+    def mouse(self, key, cols, watcher, header_visible):
+        """Handle one mouse report; return True when it belonged to the progress bar."""
+        match = re.fullmatch(r"\x1b\[<(\d+);(\d+);(\d+)([mM])", key)
+        if not match:
+            return False
+        button, x, y = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        event = match.group(4)
+
+        if event == "m":                                     # button released
+            if self.dragging and button == 0:
+                watcher.seek_preview = self._target(x)       # where the button was actually let go
+                self.cancel(watcher, commit=True)
+                return True
+            return False
+
+        if button == 0:                                      # left button pressed
+            track = watcher.track
+            if not header_visible or y != self.PROGRESS_ROW or not track:
+                return False
+            duration = float(track[3] or 0.0)
+            elapsed_text = format_time(watcher.position())
+            total_text = format_time(duration) if duration > 0 else "--:--"
+            _pad, width, first = progress_layout(cols, elapsed_text, total_text)
+            if not (first - 1 <= x <= first + width):        # a cell of slack on each side
+                return False
+            if duration <= 0:
+                self.message = "This player doesn't report the song length, so seeking isn't available."
+                return True
+            self.dragging = True
+            self.bar = (first, width, duration)
+            self.last_event = time.monotonic()
+            watcher.seek_preview = self._target(x)
+            return True
+
+        if button == 32 and self.dragging:                   # mouse moved with the button held
+            self.last_event = time.monotonic()
+            watcher.seek_preview = self._target(x)
+            return True
+        return False
 
 
 # --------------------------------------------------------------- render --
@@ -1701,6 +1822,7 @@ def main():
     update_checker = UpdateChecker(os.path.realpath(__file__))
     update_checker.start()
     update_ui_state = {"dismissed": False}
+    seekbar = SeekBar()
 
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     debug = "--debug" in sys.argv
@@ -1773,6 +1895,9 @@ def main():
                 if decoration_renderer.mouse(key, cols, lines):
                     continue
 
+                if seekbar.mouse(key, cols, lyrics, SETTINGS["show_title"] and lines >= 12):
+                    continue
+
                 action = mouse_action(key, cols)
                 if action:
                     player_control(action)
@@ -1787,6 +1912,7 @@ def main():
                     player_control("play-pause")
                     continue
                 if key in ("s", "S"):
+                    seekbar.cancel(lyrics)
                     settings_menu(update_checker, update_ui_state, decoration_renderer)
                     decoration_renderer.invalidate()
                     size = None
@@ -1814,6 +1940,15 @@ def main():
 
             if quit_requested:
                 break
+
+            seekbar.tick(lyrics)
+            if lyrics.seek_failed:
+                lyrics.seek_failed = False
+                seekbar.message = "This player doesn't support seeking."
+            if seekbar.message:
+                action_message = seekbar.message
+                action_message_until = time.monotonic() + 4.0
+                seekbar.message = ""
 
             cols, lines = shutil.get_terminal_size()
             if (cols, lines) != size:
