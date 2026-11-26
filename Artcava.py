@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Artcava - a terminal music visualizer with album-art colors, synced lyrics
+Artcava - a terminal music visualizer with album-art colors, synced lyrics,
 and interactive playback controls.
 
 Audio : captured from your default output's monitor via `parec`
@@ -14,6 +14,7 @@ Keys  : S = settings   Q = quit   L = lyrics on/off   T = song title on/off
         Mouse drag = move decorations (configure slots in Settings)
         Water reflection = Settings > Reflection (Bars visualization)
         Click or drag the progress bar = jump to any point in the song
+        Lyric animation and lyric font = Settings
 
 Kitty transparency:
     Add these to ~/.config/kitty/kitty.conf:
@@ -63,6 +64,16 @@ CONFIG_DIR = os.path.expanduser("~/.config/artcava")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.json")
 
 VISUALIZATIONS = ("Bars", "Mirror")
+LYRIC_ANIMATIONS = ("Off", "Fade", "Slide", "Karaoke", "Lively")
+LYRIC_ANIMATION_HELP = {
+    "Off": "Lyric lines change instantly.",
+    "Fade": "Lines cross-fade smoothly when the song moves to the next one.",
+    "Slide": "Fade, plus the new line glides in from the side.",
+    "Karaoke": "Fade, plus the current line fills in as it is sung.",
+    "Lively": "Everything: fade, slide, karaoke fill, a glow on the beat and a gentle shimmer.",
+}
+LYRIC_FONTS = ("Normal", "Bold", "Italic", "Script", "Gothic", "Double-struck",
+               "Monospace", "Sans bold", "Small caps", "Wide")
 
 
 COLOR_PRESETS = {
@@ -98,6 +109,9 @@ DEFAULTS = {
     "reflection_strength": 0.55,
     "reflection_length": 0.50,
     "water_distortion": 0.35,
+    # How the synced lyrics are animated and styled.
+    "lyric_animation": "Lively",
+    "lyric_font": "Normal",
 }
 
 DEFAULT_DECORATIONS = [
@@ -147,6 +161,11 @@ def load_settings():
     # safely fall back to the classic Bars visualization.
     if SETTINGS.get("visualization") not in VISUALIZATIONS:
         SETTINGS["visualization"] = "Bars"
+
+    if SETTINGS.get("lyric_animation") not in LYRIC_ANIMATIONS:
+        SETTINGS["lyric_animation"] = DEFAULTS["lyric_animation"]
+    if SETTINGS.get("lyric_font") not in LYRIC_FONTS:
+        SETTINGS["lyric_font"] = DEFAULTS["lyric_font"]
 
     for flag in ("lyrics", "show_title", "reflection"):
         if not isinstance(SETTINGS[flag], bool):
@@ -793,7 +812,7 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
     rows = [
         "Color theme", "Visualization", "Bar width", "Bar spacing",
         "Sensitivity", "Bar smoothing", "Beat flash", "Lyrics",
-        "Lyrics timing", "Song title", "Opacity",
+        "Lyrics timing", "Lyric animation", "Lyric font", "Song title", "Opacity",
         "Reflection", "Reflection strength", "Reflection length", "Water distortion",
         "Decoration slot 1", "Decoration slot 2", "Decoration slot 3",
         "Decoration slot 4", "Decoration slot 5", "Check for updates",
@@ -812,6 +831,8 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
             f'{SETTINGS["beat_flash"]:.2f}',
             "On" if SETTINGS["lyrics"] else "Off",
             f'{SETTINGS["lyrics_offset"]:+.2f}s',
+            SETTINGS["lyric_animation"],
+            SETTINGS["lyric_font"],
             "On" if SETTINGS["show_title"] else "Off",
             f'{SETTINGS["opacity"]:.2f}',
             "On" if SETTINGS["reflection"] else "Off",
@@ -847,22 +868,30 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
         elif selected == 8:
             SETTINGS["lyrics_offset"] = round(max(-5.0, min(5.0, SETTINGS["lyrics_offset"] + direction * 0.25)), 2)
         elif selected == 9:
-            SETTINGS["show_title"] = not SETTINGS["show_title"]
+            idx = LYRIC_ANIMATIONS.index(SETTINGS["lyric_animation"])
+            SETTINGS["lyric_animation"] = LYRIC_ANIMATIONS[(idx + direction) % len(LYRIC_ANIMATIONS)]
+            return LYRIC_ANIMATION_HELP[SETTINGS["lyric_animation"]]
         elif selected == 10:
+            idx = LYRIC_FONTS.index(SETTINGS["lyric_font"])
+            SETTINGS["lyric_font"] = LYRIC_FONTS[(idx + direction) % len(LYRIC_FONTS)]
+            return "Preview: " + font_preview(SETTINGS["lyric_font"])
+        elif selected == 11:
+            SETTINGS["show_title"] = not SETTINGS["show_title"]
+        elif selected == 12:
             new_value = round(max(0.10, min(1.0, SETTINGS["opacity"] + direction * 0.05)), 2)
             SETTINGS["opacity"] = new_value
             if not kitty_opacity(new_value):
                 return "Kitty opacity unavailable - check Kitty remote-control settings"
             return "Kitty opacity updated"
-        elif selected == 11:
-            SETTINGS["reflection"] = not SETTINGS["reflection"]
-        elif selected == 12:
-            SETTINGS["reflection_strength"] = round(max(0.1, min(1.0, SETTINGS["reflection_strength"] + direction * 0.05)), 2)
         elif selected == 13:
-            SETTINGS["reflection_length"] = round(max(0.2, min(1.0, SETTINGS["reflection_length"] + direction * 0.05)), 2)
+            SETTINGS["reflection"] = not SETTINGS["reflection"]
         elif selected == 14:
+            SETTINGS["reflection_strength"] = round(max(0.1, min(1.0, SETTINGS["reflection_strength"] + direction * 0.05)), 2)
+        elif selected == 15:
+            SETTINGS["reflection_length"] = round(max(0.2, min(1.0, SETTINGS["reflection_length"] + direction * 0.05)), 2)
+        elif selected == 16:
             SETTINGS["water_distortion"] = round(max(0.0, min(1.0, SETTINGS["water_distortion"] + direction * 0.05)), 2)
-        if 11 <= selected <= 14 and SETTINGS["visualization"] != "Bars":
+        if 13 <= selected <= 16 and SETTINGS["visualization"] != "Bars":
             return "The reflection only appears with the Bars visualization."
         return None
 
@@ -910,12 +939,12 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
             elif key in DOWN:
                 selected = (selected + 1) % len(rows)
                 message = ""
-            elif 15 <= selected <= 19 and key in ("\r", "\n"):
+            elif 17 <= selected <= 21 and key in ("\r", "\n"):
                 if decoration_renderer is None:
                     message = "Decoration renderer is unavailable."
                 else:
-                    decoration_menu(selected - 15, decoration_renderer)
-                    message = f"Decoration slot {selected - 14} settings closed."
+                    decoration_menu(selected - 17, decoration_renderer)
+                    message = f"Decoration slot {selected - 16} settings closed."
             elif selected == len(rows) - 1 and key in ("\r", "\n"):
                 if update_checker is None:
                     message = "Update checker is unavailable."
@@ -1523,29 +1552,150 @@ def header_block(watcher, cols, accent):
     return [line, progress_line(watcher, cols, accent)]
 
 
-def lyric_block(watcher, cols, accent):
-    state, times, lines = watcher.data
-    dim = "\x1b[38;2;110;110;125m"
-    r, g, b = (int(c) for c in accent)
-    bright = f"\x1b[1;38;2;{r};{g};{b}m"
+# -------------------------------------------------------------- lyric styling --
+def _math_map(style, digit_style=None):
+    """Map A-Z, a-z (and optionally digits) to a Unicode "Mathematical Alphanumeric" alphabet."""
+    table = {}
+    for i in range(26):
+        for base, kind in ((65, "CAPITAL"), (97, "SMALL")):
+            letter = chr(base + i)
+            for name in (f"MATHEMATICAL {style} {kind} {letter.upper()}", f"{style} {kind} {letter.upper()}"):
+                try:
+                    table[ord(letter)] = ord(unicodedata.lookup(name))
+                    break
+                except KeyError:
+                    continue
+    if digit_style:
+        words = ("ZERO", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN", "EIGHT", "NINE")
+        for digit, word in enumerate(words):
+            try:
+                table[48 + digit] = ord(unicodedata.lookup(f"MATHEMATICAL {digit_style} DIGIT {word}"))
+            except KeyError:
+                pass
+    return table
 
-    def center(text, style):
+
+_SMALL_CAPS = dict(zip("abcdefghijklmnopqrstuvwxyz", "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢ"))
+_FONT_TABLES = {
+    "Script": str.maketrans(_math_map("BOLD SCRIPT")),
+    "Gothic": str.maketrans(_math_map("BOLD FRAKTUR")),
+    "Double-struck": str.maketrans(_math_map("DOUBLE-STRUCK", "DOUBLE-STRUCK")),
+    "Monospace": str.maketrans(_math_map("MONOSPACE", "MONOSPACE")),
+    "Sans bold": str.maketrans(_math_map("SANS-SERIF BOLD", "SANS-SERIF BOLD")),
+    "Small caps": str.maketrans(_SMALL_CAPS),
+    "Wide": str.maketrans({**{c: c + 0xFEE0 for c in range(0x21, 0x7F)}, 0x20: 0x3000}),
+}
+
+
+def apply_font(text, font):
+    """Restyle text with a Unicode alphabet. Same number of characters; other characters are untouched.
+
+    Normal, Bold and Italic have no table: Bold and Italic use the terminal's own bold/italic.
+    """
+    table = _FONT_TABLES.get(font)
+    return text.translate(table) if table else text
+
+
+def font_preview(font):
+    """A short sample line in the given font, for the settings menu."""
+    sample = "The quick brown fox jumps over 123"
+    if font == "Bold":
+        return "\x1b[1m" + sample + "\x1b[0m"
+    if font == "Italic":
+        return "\x1b[3m" + sample + "\x1b[0m"
+    text = apply_font(sample, font)
+    if font in _FONT_TABLES and font not in ("Small caps", "Wide"):
+        text += "   (empty boxes? your terminal font lacks these symbols - pick Normal)"
+    return text
+
+
+LYRIC_TRANSITION = 0.45          # seconds for a line change to finish fading / sliding
+LYRIC_SLIDE_COLUMNS = 10         # how far the new line slides in from the side
+_LYRIC_DIM = (110, 110, 125)
+_WHITE = (255, 255, 255)
+
+
+def _mix(a, b, t):
+    """Blend color a toward color b by t (0..1)."""
+    return tuple(int(max(0, min(255, round(x + (y - x) * t)))) for x, y in zip(a, b))
+
+
+def _fg(color, bold=False):
+    return f"\x1b[{'1;' if bold else ''}38;2;{color[0]};{color[1]};{color[2]}m"
+
+
+def lyric_block(watcher, cols, accent, pulse=0.0):
+    """LYRIC_ROWS terminal lines: a spacer, then the previous, current and next lyric.
+
+    Looks are controlled by SETTINGS["lyric_animation"] and SETTINGS["lyric_font"]. All of the
+    animation is worked out from the song position (no stored state), so it stays correct when
+    you seek, and with animation Off and font Normal the plain layout is unchanged.
+    `pulse` (0..1, from the beat detector) makes the Lively mode glow on the beat.
+    """
+    state, times, lines = watcher.data
+    mode = SETTINGS["lyric_animation"]
+    font = SETTINGS["lyric_font"]
+    attr = {"Bold": "\x1b[1m", "Italic": "\x1b[3m"}.get(font, "")     # the terminal's own bold / italic
+    accent = tuple(int(c) for c in accent)
+
+    def place(text, shift=0):
+        """Styled, trimmed text and its left padding (centered, plus an optional sideways shift)."""
+        text = fit(apply_font(text, font), max(1, cols - 2))
+        width = text_width(text)
+        return text, max(0, min((cols - width) // 2 + shift, cols - width))
+
+    def plain(text, color, bold=False, shift=0):
         if not text:
             return "\x1b[K"
-        text = fit(text, max(1, cols - 2))
-        return " " * ((cols - text_width(text)) // 2) + style + text + "\x1b[0m\x1b[K"
+        text, pad = place(text, shift)
+        return " " * pad + attr + _fg(color, bold) + text + "\x1b[0m\x1b[K"
+
+    def sweep(text, age, gap, color, shift):
+        """The current line with a karaoke-style fill that follows the singing."""
+        text, pad = place(text, shift)
+        sing = min(max(gap - 0.15, 0.3), max(1.2, 0.085 * len(text)))   # time to "sing" the line
+        done = int(max(0.0, min(1.0, age / sing)) * len(text))
+        sung, head, rest = text[:done], text[done:done + 1], text[done + 1:]
+        unsung = _mix(_LYRIC_DIM, color, 0.40)
+        return (" " * pad + attr + _fg(color, True) + sung
+                + _fg(_mix(color, _WHITE, 0.65), True) + head
+                + _fg(unsung) + rest + "\x1b[0m\x1b[K")
 
     if state == "ok":
-        i = bisect.bisect_right(times, watcher.position() + SETTINGS["lyrics_offset"]) - 1
+        pos = watcher.position() + SETTINGS["lyrics_offset"]
+        i = bisect.bisect_right(times, pos) - 1
         prev = lines[i - 1] if i >= 1 else ""
         cur = lines[i] if i >= 0 else ""
         nxt = lines[i + 1] if i + 1 < len(lines) else ""
-        if i >= 0 and not cur:
+        is_note = i >= 0 and not cur
+        if is_note:
             cur = "♪"
-        return ["\x1b[K", center(prev, dim), center(cur, bright), center(nxt, dim)]
+
+        if mode == "Off":
+            return ["\x1b[K", plain(prev, _LYRIC_DIM), plain(cur, accent, True), plain(nxt, _LYRIC_DIM)]
+
+        age = pos - times[i] if i >= 0 else 1e9                      # seconds since this line began
+        progress = max(0.0, min(1.0, age / LYRIC_TRANSITION))
+        ease = 1.0 - (1.0 - progress) ** 3                           # fast start, soft landing
+        color = accent
+        if mode == "Lively":
+            breath = 1.0 + 0.05 * float(np.sin(6.2832 * 0.4 * time.monotonic()))
+            color = _mix(accent, _WHITE, min(1.0, max(0.0, pulse)) * 0.35)   # glow on the beat
+            color = tuple(min(255, int(c * breath)) for c in color)          # slow shimmer
+        shift = int(round((1.0 - ease) * LYRIC_SLIDE_COLUMNS)) if mode in ("Slide", "Lively") else 0
+
+        prev_color = _mix(accent, _LYRIC_DIM, ease)                  # the old line fades down...
+        cur_color = _mix(_LYRIC_DIM, color, ease)                    # ...the new one lights up...
+        next_color = _mix((0, 0, 0), _LYRIC_DIM, ease)               # ...and the next fades in
+        if mode in ("Karaoke", "Lively") and i >= 0 and not is_note:
+            gap = times[i + 1] - times[i] if i + 1 < len(times) else 5.0
+            cur_line = sweep(cur, age, gap, cur_color, shift)
+        else:
+            cur_line = plain(cur, cur_color, True, shift)
+        return ["\x1b[K", plain(prev, prev_color), cur_line, plain(nxt, next_color)]
 
     msg = {"loading": "Searching for lyrics…", "none": "No synced lyrics found"}.get(state, "")
-    return ["\x1b[K", "\x1b[K", center(msg, dim), "\x1b[K"]
+    return ["\x1b[K", "\x1b[K", plain(msg, _LYRIC_DIM), "\x1b[K"]
 
 
 class SeekBar:
@@ -1981,7 +2131,7 @@ def main():
             mid = current[len(current) // 2]
             accent = mid + (255 - mid) * 0.35
             header = header_block(lyrics, cols, accent) if show_title else None
-            extra = lyric_block(lyrics, cols, accent) if show_lyrics else None
+            extra = lyric_block(lyrics, cols, accent, analyzer.pulse) if show_lyrics else None
 
             frame = render(
                 vals, current, rows, analyzer.pulse,
