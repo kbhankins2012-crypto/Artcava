@@ -988,9 +988,9 @@ def update_notice_mouse_action(key, cols, lines):
 
 # --------------------------------------------------------------- menu --
 def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer=None, art_watcher=None):
-    """Display and edit Artcava's settings, including five decoration slots."""
+    """Display and edit Artcava's settings, including custom themes and decorations."""
     rows = [
-        "Color theme", "Visualization", "Bar width", "Bar spacing",
+        "Color theme", "Custom color themes", "Visualization", "Bar width", "Bar spacing",
         "Sensitivity", "Bar smoothing", "Beat flash", "Lyrics",
         "Lyrics timing", "Lyric animation", "Lyric font", "Song title", "Opacity",
         "Reflection", "Reflection strength", "Reflection length", "Water distortion",
@@ -1003,7 +1003,8 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
 
     def value_for(i):
         values = [
-            SETTINGS["color_mode"], SETTINGS["visualization"],
+            SETTINGS["color_mode"], "Manage, save, rename, or delete palettes",
+            SETTINGS["visualization"],
             str(SETTINGS["bar_width"]), str(SETTINGS["gap"]),
             f'{SETTINGS["sensitivity"]:.1f}x',
             f'{SETTINGS["release_time"]:.2f}s',
@@ -1031,47 +1032,49 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
             idx = color_names.index(SETTINGS["color_mode"])
             SETTINGS["color_mode"] = color_names[(idx + direction) % len(color_names)]
         elif selected == 1:
+            return "Press Enter to manage custom color themes."
+        elif selected == 2:
             idx = VISUALIZATIONS.index(SETTINGS["visualization"])
             SETTINGS["visualization"] = VISUALIZATIONS[(idx + direction) % len(VISUALIZATIONS)]
-        elif selected == 2:
-            SETTINGS["bar_width"] = max(1, min(4, SETTINGS["bar_width"] + direction))
         elif selected == 3:
-            SETTINGS["gap"] = max(0, min(4, SETTINGS["gap"] + direction))
+            SETTINGS["bar_width"] = max(1, min(4, SETTINGS["bar_width"] + direction))
         elif selected == 4:
-            SETTINGS["sensitivity"] = round(max(0.5, min(2.5, SETTINGS["sensitivity"] + direction * 0.1)), 1)
+            SETTINGS["gap"] = max(0, min(4, SETTINGS["gap"] + direction))
         elif selected == 5:
-            SETTINGS["release_time"] = round(max(0.06, min(0.5, SETTINGS["release_time"] + direction * 0.02)), 2)
+            SETTINGS["sensitivity"] = round(max(0.5, min(2.5, SETTINGS["sensitivity"] + direction * 0.1)), 1)
         elif selected == 6:
-            SETTINGS["beat_flash"] = round(max(0.0, min(1.0, SETTINGS["beat_flash"] + direction * 0.05)), 2)
+            SETTINGS["release_time"] = round(max(0.06, min(0.5, SETTINGS["release_time"] + direction * 0.02)), 2)
         elif selected == 7:
-            SETTINGS["lyrics"] = not SETTINGS["lyrics"]
+            SETTINGS["beat_flash"] = round(max(0.0, min(1.0, SETTINGS["beat_flash"] + direction * 0.05)), 2)
         elif selected == 8:
-            SETTINGS["lyrics_offset"] = round(max(-5.0, min(5.0, SETTINGS["lyrics_offset"] + direction * 0.25)), 2)
+            SETTINGS["lyrics"] = not SETTINGS["lyrics"]
         elif selected == 9:
+            SETTINGS["lyrics_offset"] = round(max(-5.0, min(5.0, SETTINGS["lyrics_offset"] + direction * 0.25)), 2)
+        elif selected == 10:
             idx = LYRIC_ANIMATIONS.index(SETTINGS["lyric_animation"])
             SETTINGS["lyric_animation"] = LYRIC_ANIMATIONS[(idx + direction) % len(LYRIC_ANIMATIONS)]
             return LYRIC_ANIMATION_HELP[SETTINGS["lyric_animation"]]
-        elif selected == 10:
+        elif selected == 11:
             idx = LYRIC_FONTS.index(SETTINGS["lyric_font"])
             SETTINGS["lyric_font"] = LYRIC_FONTS[(idx + direction) % len(LYRIC_FONTS)]
             return "Preview: " + font_preview(SETTINGS["lyric_font"])
-        elif selected == 11:
-            SETTINGS["show_title"] = not SETTINGS["show_title"]
         elif selected == 12:
+            SETTINGS["show_title"] = not SETTINGS["show_title"]
+        elif selected == 13:
             new_value = round(max(0.10, min(1.0, SETTINGS["opacity"] + direction * 0.05)), 2)
             SETTINGS["opacity"] = new_value
             if not kitty_opacity(new_value):
                 return "Kitty opacity unavailable - check Kitty remote-control settings"
             return "Kitty opacity updated"
-        elif selected == 13:
-            SETTINGS["reflection"] = not SETTINGS["reflection"]
         elif selected == 14:
-            SETTINGS["reflection_strength"] = round(max(0.1, min(1.0, SETTINGS["reflection_strength"] + direction * 0.05)), 2)
+            SETTINGS["reflection"] = not SETTINGS["reflection"]
         elif selected == 15:
-            SETTINGS["reflection_length"] = round(max(0.2, min(1.0, SETTINGS["reflection_length"] + direction * 0.05)), 2)
+            SETTINGS["reflection_strength"] = round(max(0.1, min(1.0, SETTINGS["reflection_strength"] + direction * 0.05)), 2)
         elif selected == 16:
+            SETTINGS["reflection_length"] = round(max(0.2, min(1.0, SETTINGS["reflection_length"] + direction * 0.05)), 2)
+        elif selected == 17:
             SETTINGS["water_distortion"] = round(max(0.0, min(1.0, SETTINGS["water_distortion"] + direction * 0.05)), 2)
-        if 13 <= selected <= 16 and SETTINGS["visualization"] != "Bars":
+        if 14 <= selected <= 17 and SETTINGS["visualization"] != "Bars":
             return "The reflection only appears with the Bars visualization."
         return None
 
@@ -1079,7 +1082,7 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
     while True:
         out = [
             "\x1b[2J\x1b[H\x1b[1;36m A R T C A V A / S E T T I N G S\x1b[0m\n\n",
-            " Navigate with arrow keys. Decoration slots open their own settings.\n\n",
+            " Navigate with arrow keys. Choose Custom color themes to save and manage palettes.\n\n",
         ]
         # Show only the rows that fit the window, keeping the selected row in view.
         visible = max(6, shutil.get_terminal_size().lines - 11)
@@ -1119,15 +1122,15 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
             elif key in DOWN:
                 selected = (selected + 1) % len(rows)
                 message = ""
-            elif selected == 0 and key in ("\r", "\n"):
+            elif selected == 1 and key in ("\r", "\n"):
                 custom_color_theme_menu(art_watcher)
                 message = "Custom color themes closed."
-            elif 17 <= selected <= 21 and key in ("\r", "\n"):
+            elif 18 <= selected <= 22 and key in ("\r", "\n"):
                 if decoration_renderer is None:
                     message = "Decoration renderer is unavailable."
                 else:
-                    decoration_menu(selected - 17, decoration_renderer)
-                    message = f"Decoration slot {selected - 16} settings closed."
+                    decoration_menu(selected - 18, decoration_renderer)
+                    message = f"Decoration slot {selected - 17} settings closed."
             elif selected == len(rows) - 1 and key in ("\r", "\n"):
                 if update_checker is None:
                     message = "Update checker is unavailable."
