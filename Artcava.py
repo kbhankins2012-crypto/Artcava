@@ -116,6 +116,8 @@ DEFAULTS = {
     # How the synced lyrics are animated and styled.
     "lyric_animation": "Lively",
     "lyric_font": "Normal",
+    # User-created RGB palettes, stored directly in settings.json.
+    "custom_color_themes": {},
 }
 
 DEFAULT_DECORATIONS = [
@@ -158,7 +160,35 @@ def load_settings():
         if key in saved:
             SETTINGS[key] = saved[key]
 
-    if not isinstance(SETTINGS["color_mode"], str) or SETTINGS["color_mode"] not in COLOR_PRESETS:
+    # Validate custom palettes independently so one malformed entry cannot
+    # prevent Artcava from loading the rest of the user's settings.
+    raw_custom = saved.get("custom_color_themes", {})
+    custom = {}
+    if isinstance(raw_custom, dict):
+        reserved = {name.casefold() for name in COLOR_PRESETS}
+        for raw_name, raw_colors in raw_custom.items():
+            if not isinstance(raw_name, str):
+                continue
+            name = raw_name.strip()[:40]
+            if not name or name.casefold() in reserved or name.casefold() in {n.casefold() for n in custom}:
+                continue
+            if not isinstance(raw_colors, list) or not 2 <= len(raw_colors) <= 8:
+                continue
+            palette = []
+            valid = True
+            for color in raw_colors:
+                if not isinstance(color, (list, tuple)) or len(color) != 3:
+                    valid = False
+                    break
+                if any(type(channel) is not int or not 0 <= channel <= 255 for channel in color):
+                    valid = False
+                    break
+                palette.append(list(color))
+            if valid:
+                custom[name] = palette
+    SETTINGS["custom_color_themes"] = custom
+
+    if not isinstance(SETTINGS["color_mode"], str) or SETTINGS["color_mode"] not in COLOR_PRESETS and SETTINGS["color_mode"] not in custom:
         SETTINGS["color_mode"] = DEFAULTS["color_mode"]
 
     # Older settings files, including files with removed experimental modes,
@@ -216,8 +246,154 @@ def save_settings():
 
 
 def active_palette(album_palette):
-    preset = COLOR_PRESETS[SETTINGS["color_mode"]]
+    """Return the selected built-in, custom, or live album-art palette."""
+    mode = SETTINGS.get("color_mode", DEFAULTS["color_mode"])
+    custom = SETTINGS.get("custom_color_themes", {})
+    if mode in custom:
+        return [tuple(color) for color in custom[mode]]
+    preset = COLOR_PRESETS.get(mode)
     return album_palette if preset is None else preset
+
+
+def color_theme_names():
+    """Built-in themes followed by the user's saved custom themes."""
+    return list(COLOR_PRESETS) + list(SETTINGS.get("custom_color_themes", {}))
+
+
+def palette_preview(colors):
+    """Render small true-color swatches for a palette in the terminal."""
+    return " ".join(
+        f"\x1b[48;2;{r};{g};{b}m   \x1b[0m"
+        for r, g, b in colors
+    )
+
+
+def prompt_text(prompt, max_length=40):
+    """Read a normal echoed line while temporarily restoring canonical terminal input."""
+    fd = sys.stdin.fileno()
+    try:
+        previous = termios.tcgetattr(fd)
+        canonical = list(previous)
+        canonical[3] |= termios.ICANON | termios.ECHO
+        termios.tcsetattr(fd, termios.TCSADRAIN, canonical)
+        try:
+            value = input(prompt)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+    except (termios.error, OSError, EOFError):
+        return ""
+    return value.strip()[:max_length]
+
+
+def custom_color_theme_menu(art_watcher=None):
+    """Save, select, rename, and delete custom palettes."""
+    selected = 0
+    message = ""
+
+    def live_palette():
+        album = art_watcher.palette if art_watcher is not None else DEFAULT_PALETTE
+        return [tuple(int(channel) for channel in color) for color in active_palette(album)]
+
+    while True:
+        names = list(SETTINGS.get("custom_color_themes", {}))
+        rows = ["Save current visualizer colors"] + names + ["Back"]
+        selected = max(0, min(selected, len(rows) - 1))
+        preview = palette_preview(live_palette())
+        out = [
+            "\x1b[2J\x1b[H\x1b[1;36m A R T C A V A / CUSTOM COLOR THEMES\x1b[0m\n\n",
+            " Colors currently used by the visualizer: " + preview + "\n\n",
+        ]
+        if not names:
+            out.append(" No custom themes saved yet.\n\n")
+        for index, label in enumerate(rows):
+            value = "Save palette" if index == 0 else ("Back" if index == len(rows) - 1 else "Saved theme")
+            marker = "\x1b[1;36m ❯ " if index == selected else "   "
+            end = "\x1b[0m" if index == selected else ""
+            out.append(f"{marker}{label:<34} {value:>14}{end}\n")
+            if 0 < index < len(rows) - 1:
+                out.append("     " + palette_preview(SETTINGS["custom_color_themes"].get(label, [])) + "\n")
+        if message:
+            out.append("\n " + message + "\n")
+        out.append("\n Enter select/save   R rename highlighted   D delete highlighted   Esc back\n")
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
+        for key in read_keys():
+            if key in UP:
+                selected = (selected - 1) % len(rows)
+                message = ""
+            elif key in DOWN:
+                selected = (selected + 1) % len(rows)
+                message = ""
+            elif key in ("\x1b", "q", "Q"):
+                save_settings()
+                return
+            elif selected == 0 and key in ("\r", "\n", "s", "S"):
+                palette = live_palette()
+                name = prompt_text("Name this color theme: ", 40)
+                if not name:
+                    message = "Theme name was empty or input was cancelled."
+                    continue
+                reserved = {item.casefold() for item in COLOR_PRESETS}
+                existing = {item.casefold(): item for item in SETTINGS["custom_color_themes"]}
+                if name.casefold() in reserved:
+                    message = "That name is already used by a built-in theme."
+                    continue
+                old_name = existing.get(name.casefold())
+                if old_name and old_name != name:
+                    SETTINGS["custom_color_themes"].pop(old_name, None)
+                SETTINGS["custom_color_themes"][name] = [list(color) for color in palette]
+                SETTINGS["color_mode"] = name
+                save_settings()
+                names = list(SETTINGS["custom_color_themes"])
+                selected = names.index(name) + 1
+                message = f'Saved and selected "{name}".'
+                break
+            elif 0 < selected < len(rows) - 1 and key in ("\r", "\n"):
+                name = names[selected - 1]
+                SETTINGS["color_mode"] = name
+                save_settings()
+                message = f'Selected "{name}".'
+                break
+            elif 0 < selected < len(rows) - 1 and key in ("r", "R"):
+                old_name = names[selected - 1]
+                new_name = prompt_text(f'Rename "{old_name}" to: ', 40)
+                if not new_name:
+                    message = "Theme name was empty or input was cancelled."
+                    continue
+                reserved = {item.casefold() for item in COLOR_PRESETS}
+                if new_name.casefold() in reserved:
+                    message = "That name is already used by a built-in theme."
+                    continue
+                if new_name.casefold() != old_name.casefold() and any(
+                    item.casefold() == new_name.casefold() for item in names
+                ):
+                    message = "A custom theme with that name already exists."
+                    continue
+                SETTINGS["custom_color_themes"][new_name] = SETTINGS["custom_color_themes"].pop(old_name)
+                if SETTINGS["color_mode"] == old_name:
+                    SETTINGS["color_mode"] = new_name
+                save_settings()
+                selected = names.index(old_name) + 1
+                message = f'Renamed to "{new_name}".'
+                break
+            elif 0 < selected < len(rows) - 1 and key in ("d", "D"):
+                name = names[selected - 1]
+                confirmation = prompt_text(f'Type DELETE to remove "{name}": ', 10)
+                if confirmation == "DELETE":
+                    SETTINGS["custom_color_themes"].pop(name, None)
+                    if SETTINGS["color_mode"] == name:
+                        SETTINGS["color_mode"] = DEFAULTS["color_mode"]
+                    save_settings()
+                    selected = max(0, selected - 1)
+                    message = f'Deleted "{name}".'
+                else:
+                    message = "Deletion cancelled."
+                break
+            elif selected == len(rows) - 1 and key in ("\r", "\n"):
+                save_settings()
+                return
+
 
 
 # --------------------------------------------------------------- Kitty --
@@ -811,7 +987,7 @@ def update_notice_mouse_action(key, cols, lines):
 
 
 # --------------------------------------------------------------- menu --
-def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer=None):
+def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer=None, art_watcher=None):
     """Display and edit Artcava's settings, including five decoration slots."""
     rows = [
         "Color theme", "Visualization", "Bar width", "Bar spacing",
@@ -822,7 +998,6 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
         "Decoration slot 4", "Decoration slot 5", "Check for updates",
     ]
     selected = 0
-    color_names = list(COLOR_PRESETS)
     help_text = "↑/↓ select   ←/→ change   Enter open/select   S/Esc close"
     update_prompt = False
 
@@ -852,6 +1027,7 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
 
     def change(direction):
         if selected == 0:
+            color_names = color_theme_names()
             idx = color_names.index(SETTINGS["color_mode"])
             SETTINGS["color_mode"] = color_names[(idx + direction) % len(color_names)]
         elif selected == 1:
@@ -943,6 +1119,9 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
             elif key in DOWN:
                 selected = (selected + 1) % len(rows)
                 message = ""
+            elif selected == 0 and key in ("\r", "\n"):
+                custom_color_theme_menu(art_watcher)
+                message = "Custom color themes closed."
             elif 17 <= selected <= 21 and key in ("\r", "\n"):
                 if decoration_renderer is None:
                     message = "Decoration renderer is unavailable."
@@ -2067,7 +2246,7 @@ def main():
                     continue
                 if key in ("s", "S"):
                     seekbar.cancel(lyrics)
-                    settings_menu(update_checker, update_ui_state, decoration_renderer)
+                    settings_menu(update_checker, update_ui_state, decoration_renderer, watcher)
                     decoration_renderer.invalidate()
                     size = None
                     next_t = last = time.perf_counter()
