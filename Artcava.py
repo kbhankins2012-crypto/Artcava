@@ -157,6 +157,8 @@ DEFAULTS = {
     # not surprised by routing changes after updating. Values persist in
     # settings.json; missing keys (old settings files) get these defaults.
     "audio_enabled": False,
+    "audio_preset": "Custom",
+    "audio_presets": {},
     "audio_volume": 100,
     "audio_bass": 0.0,
     "audio_mid": 0.0,
@@ -177,6 +179,7 @@ DEFAULT_DECORATIONS = [
 ]
 
 SETTINGS = dict(DEFAULTS)
+SETTINGS["audio_presets"] = {}
 SETTINGS["decorations"] = [dict(item) for item in DEFAULT_DECORATIONS]
 
 LIMITS = [
@@ -201,6 +204,100 @@ LIMITS = [
     ("audio_eq_3640", -12.0, 12.0, float),
     ("audio_eq_14000", -12.0, 12.0, float),
 ]
+
+
+# Presets intentionally do not include the processing on/off switch: selecting
+# a sound must never reroute audio or unexpectedly enable processing.
+AUDIO_PRESET_KEYS = ("audio_volume", "audio_bass", "audio_mid", "audio_treble",
+                     "audio_eq_60", "audio_eq_230", "audio_eq_910",
+                     "audio_eq_3640", "audio_eq_14000")
+AUDIO_PRESET_MAX = 50
+AUDIO_PRESET_NAME_MAX = 24
+
+
+def normalize_preset(values):
+    """Validate a saved sound using the same limits as the Audio sliders."""
+    if not isinstance(values, dict):
+        return None
+    result = {}
+    for key, lo, hi, cast in LIMITS:
+        if key not in AUDIO_PRESET_KEYS:
+            continue
+        try:
+            value = cast(values.get(key, DEFAULTS[key]))
+            if not math.isfinite(value):
+                raise ValueError
+            result[key] = max(lo, min(hi, value))
+        except (TypeError, ValueError, OverflowError):
+            result[key] = DEFAULTS[key]
+    return result
+
+
+def valid_preset_name(name):
+    return (isinstance(name, str) and name == name.strip() and 0 < len(name) <= AUDIO_PRESET_NAME_MAX
+            and all(ch.isprintable() for ch in name)
+            and name.casefold() not in ("flat", "custom"))
+
+
+def current_audio_values():
+    return {key: SETTINGS[key] for key in AUDIO_PRESET_KEYS}
+
+
+def preset_values(name):
+    if name == "Flat":
+        return {key: DEFAULTS[key] for key in AUDIO_PRESET_KEYS}
+    return SETTINGS["audio_presets"].get(name)
+
+
+def preset_label():
+    name = SETTINGS.get("audio_preset", "Custom")
+    values = preset_values(name)
+    return name + (" *" if values is not None and values != current_audio_values() else "")
+
+
+def apply_audio_preset(name):
+    values = preset_values(name)
+    if values is None:
+        return False
+    SETTINGS.update(values)
+    SETTINGS["audio_preset"] = name
+    save_settings()
+    return True
+
+
+def cycle_audio_preset(direction):
+    names = ["Flat"] + list(SETTINGS["audio_presets"])
+    current = SETTINGS.get("audio_preset", "Custom")
+    index = names.index(current) if current in names else (-1 if direction > 0 else 0)
+    name = names[(index + direction) % len(names)]
+    apply_audio_preset(name)
+    return name
+
+
+def save_audio_preset(name, overwrite=False):
+    if not valid_preset_name(name):
+        return False, "Choose a name (1-24 characters); Flat and Custom are reserved."
+    presets = SETTINGS["audio_presets"]
+    existing = next((n for n in presets if n.casefold() == name.casefold()), None)
+    if existing and not overwrite:
+        return False, "Name already exists. Choose another or overwrite the selected preset."
+    if not existing and len(presets) >= AUDIO_PRESET_MAX:
+        return False, "Preset limit reached; delete one first."
+    name = existing or name
+    presets[name] = current_audio_values()
+    SETTINGS["audio_preset"] = name
+    save_settings()
+    return True, f"Saved preset: {name}"
+
+
+def delete_audio_preset(name):
+    if name not in SETTINGS["audio_presets"]:
+        return False
+    del SETTINGS["audio_presets"][name]
+    if SETTINGS["audio_preset"] == name:
+        SETTINGS["audio_preset"] = "Custom"
+    save_settings()
+    return True
 
 
 # -------------------------------------------------------------- settings --
@@ -242,6 +339,23 @@ def load_settings():
             SETTINGS[key] = max(lo, min(hi, value))
         except (TypeError, ValueError, OverflowError):
             SETTINGS[key] = DEFAULTS[key]
+
+    raw_presets = SETTINGS.get("audio_presets")
+    presets = {}
+    seen_names = set()
+    if isinstance(raw_presets, dict):
+        for name, raw in raw_presets.items():
+            if len(presets) >= AUDIO_PRESET_MAX:
+                break
+            if not valid_preset_name(name) or name.casefold() in seen_names:
+                continue
+            normalized_preset = normalize_preset(raw)
+            if normalized_preset is not None:
+                presets[name] = normalized_preset
+                seen_names.add(name.casefold())
+    SETTINGS["audio_presets"] = presets
+    if SETTINGS.get("audio_preset") not in ("Flat", "Custom", *presets):
+        SETTINGS["audio_preset"] = "Custom"
 
     # Decoration paths and dimensions are loaded independently, so a damaged
     # slot in settings.json cannot stop the rest of Artcava from launching.
@@ -889,9 +1003,9 @@ _RESET = "\x1b[0m"
 _TEXT, _BRIGHT, _MUTED, _GREEN, _TRACK = (200, 205, 218), (236, 239, 248), (112, 116, 135), (110, 225, 150), (70, 74, 92)
 
 # Rows are grouped into sections; each entry is the index of the first row in that section.
-# Audio rows (13-22) live only here in Settings; the main visualizer screen is unchanged.
+# Audio rows live only here in Settings; the main visualizer screen is unchanged.
 SETTINGS_SECTIONS = {0: "LOOK", 7: "LYRICS & TITLE", 12: "WINDOW", 13: "AUDIO",
-                     23: "WATER REFLECTION", 27: "DECORATIONS", 32: "UPDATES"}
+                     24: "WATER REFLECTION", 28: "DECORATIONS", 33: "UPDATES"}
 SETTINGS_HELP = [
     "Bar colors. 'Album art' follows the cover; the others are fixed palettes.",           # 0  Color theme
     "Bars rise from the bottom. Mirror grows outward from the middle.",                    # 1  Visualization
@@ -907,6 +1021,7 @@ SETTINGS_HELP = [
     "Show the song title, progress bar and playback buttons at the top.",                  # 11 Song title
     "Window transparency. Kitty only, with remote control enabled.",                       # 12 Opacity
     "Route audio through Artcava DSP (virtual sink). Off = normal audio.",                 # 13 Audio processing
+    "Left/Right applies a preset. Enter opens save, overwrite and delete options.",       # 14 Audio presets
     "Master output volume. 0-150%. Applies to the processed audio only.",                  # 14 Master volume
     "Boost low frequencies. 0 to +12 dB.",                                                 # 15 Bass boost
     "Adjust middle frequencies around 1 kHz. -12 to +12 dB.",                              # 16 Midrange
@@ -978,6 +1093,12 @@ def _slider(fraction, cells, accent):
 def settings_widget(i, accent, palette):
     """The value column for settings row i, as colored text (foreground colors only)."""
     s = SETTINGS
+
+    # The preset was inserted at row 14; preserve all legacy row mappings.
+    if i == 14:
+        return f"{_fg(_MUTED)}◂ {_fg(_BRIGHT)}{preset_label()} {_fg(_MUTED)}▸"
+    if i > 14:
+        i -= 1
 
     def choice(text):
         return f"{_fg(_MUTED)}◂ {_fg(_BRIGHT)}{text} {_fg(_MUTED)}▸"
@@ -1127,13 +1248,102 @@ def settings_screen(rows, selected, message, update_prompt, accent, palette, col
     return "\x1b[2J\x1b[H" + pad_top + "\n".join(out)
 
 
+
+def audio_preset_name_prompt():
+    """Enter a printable preset name without leaving the terminal UI."""
+    name = ""
+    while True:
+        cols, _lines = shutil.get_terminal_size()
+        width = max(10, cols - 4)
+        sys.stdout.write("\x1b[2J\x1b[H\x1b[1;36m A R T C A V A / SAVE AUDIO PRESET\x1b[0m\n\n")
+        sys.stdout.write(" " + fit("Enter a name for the current audio settings:", width) + "\n\n")
+        sys.stdout.write("  " + fit(name + "_", width) + "\n\n")
+        sys.stdout.write(" Enter save   Backspace erase   Esc cancel\n")
+        sys.stdout.flush()
+        for key in read_keys():
+            if key == "\x1b":
+                return None
+            if key in ("\r", "\n"):
+                return name.strip()
+            if key in ("\x7f", "\b"):
+                name = name[:-1]
+            elif len(key) == 1 and key.isprintable() and len(name) < AUDIO_PRESET_NAME_MAX:
+                name += key
+
+
+def audio_presets_menu():
+    """Choose, save, overwrite, or delete audio presets in Settings only."""
+    rows = ("Choose preset", "Save current settings as new", "Overwrite selected preset",
+            "Delete selected preset", "Back")
+    selected = 0
+    message = "Left/Right switches and applies a preset. * means edited since saving."
+    confirm_delete = False
+    while True:
+        cols, _lines = shutil.get_terminal_size()
+        width = max(10, cols - 4)
+        sys.stdout.write("\x1b[2J\x1b[H\x1b[1;36m A R T C A V A / AUDIO PRESETS\x1b[0m\n\n")
+        for i, label in enumerate(rows):
+            marker = "\x1b[1;36m ❯ " if i == selected else "   "
+            value = "  ◂ " + preset_label() + " ▸" if i == 0 else ""
+            sys.stdout.write(marker + fit(label + value, width) + "\x1b[0m\n")
+        sys.stdout.write("\n " + fit(message, width) + "\n")
+        sys.stdout.write("\n ↑/↓ select   ←/→ choose   Enter open   Esc back\n")
+        sys.stdout.flush()
+        for key in read_keys():
+            if confirm_delete:
+                confirm_delete = False
+                if key in ("y", "Y"):
+                    name = SETTINGS["audio_preset"]
+                    if delete_audio_preset(name):
+                        message = f"Deleted {name}; current audio settings are unchanged."
+                    else:
+                        message = "Flat and Custom cannot be deleted."
+                else:
+                    message = "Delete cancelled."
+                continue
+            if key in ("\x1b",):
+                return "Audio preset settings closed."
+            if key in UP:
+                selected = (selected - 1) % len(rows)
+                message = ""
+            elif key in DOWN:
+                selected = (selected + 1) % len(rows)
+                message = ""
+            elif selected == 0 and (key in LEFT or key in RIGHT):
+                name = cycle_audio_preset(-1 if key in LEFT else 1)
+                message = f"Applied {name}. Processing on/off is unchanged."
+            elif key in ("\r", "\n"):
+                if selected == 0:
+                    message = "Use Left/Right to choose and apply a preset."
+                elif selected == 1:
+                    name = audio_preset_name_prompt()
+                    if name is None:
+                        message = "Save cancelled."
+                    else:
+                        _ok, message = save_audio_preset(name)
+                elif selected == 2:
+                    name = SETTINGS["audio_preset"]
+                    if name in SETTINGS["audio_presets"]:
+                        _ok, message = save_audio_preset(name, overwrite=True)
+                    else:
+                        message = "Choose a saved preset first. Flat cannot be overwritten."
+                elif selected == 3:
+                    name = SETTINGS["audio_preset"]
+                    if name in SETTINGS["audio_presets"]:
+                        message = f"Delete {name}? Press Y to confirm; any other key cancels."
+                        confirm_delete = True
+                    else:
+                        message = "Choose a saved preset first. Flat cannot be deleted."
+                else:
+                    return "Audio preset settings closed."
+
 def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer=None, accent=None, palette=None, audio_dsp=None):
     """Display and edit Artcava's settings, including five decoration slots."""
     rows = [
         "Color theme", "Visualization", "Bar width", "Bar spacing",
         "Sensitivity", "Bar smoothing", "Beat flash", "Lyrics",
         "Lyrics timing", "Lyric animation", "Lyric font", "Song title", "Opacity",
-        "Audio processing", "Master volume", "Bass boost", "Midrange", "Treble",
+        "Audio processing", "Audio presets", "Master volume", "Bass boost", "Midrange", "Treble",
         "EQ 60 Hz", "EQ 230 Hz", "EQ 910 Hz", "EQ 3.6 kHz", "EQ 14 kHz",
         "Reflection", "Reflection strength", "Reflection length", "Water distortion",
         "Decoration slot 1", "Decoration slot 2", "Decoration slot 3",
@@ -1144,43 +1354,46 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
     update_prompt = False
 
     def change(direction):
-        if selected == 0:
+        if selected == 14:
+            return f"Applied preset: {cycle_audio_preset(direction)}"
+        row = selected if selected < 14 else selected - 1
+        if row == 0:
             idx = color_names.index(SETTINGS["color_mode"])
             SETTINGS["color_mode"] = color_names[(idx + direction) % len(color_names)]
-        elif selected == 1:
+        elif row == 1:
             idx = VISUALIZATIONS.index(SETTINGS["visualization"])
             SETTINGS["visualization"] = VISUALIZATIONS[(idx + direction) % len(VISUALIZATIONS)]
-        elif selected == 2:
+        elif row == 2:
             SETTINGS["bar_width"] = max(1, min(4, SETTINGS["bar_width"] + direction))
-        elif selected == 3:
+        elif row == 3:
             SETTINGS["gap"] = max(0, min(4, SETTINGS["gap"] + direction))
-        elif selected == 4:
+        elif row == 4:
             SETTINGS["sensitivity"] = round(max(0.5, min(2.5, SETTINGS["sensitivity"] + direction * 0.1)), 1)
-        elif selected == 5:
+        elif row == 5:
             SETTINGS["release_time"] = round(max(0.06, min(0.5, SETTINGS["release_time"] + direction * 0.02)), 2)
-        elif selected == 6:
+        elif row == 6:
             SETTINGS["beat_flash"] = round(max(0.0, min(1.0, SETTINGS["beat_flash"] + direction * 0.05)), 2)
-        elif selected == 7:
+        elif row == 7:
             SETTINGS["lyrics"] = not SETTINGS["lyrics"]
-        elif selected == 8:
+        elif row == 8:
             SETTINGS["lyrics_offset"] = round(max(-5.0, min(5.0, SETTINGS["lyrics_offset"] + direction * 0.25)), 2)
-        elif selected == 9:
+        elif row == 9:
             idx = LYRIC_ANIMATIONS.index(SETTINGS["lyric_animation"])
             SETTINGS["lyric_animation"] = LYRIC_ANIMATIONS[(idx + direction) % len(LYRIC_ANIMATIONS)]
             return LYRIC_ANIMATION_HELP[SETTINGS["lyric_animation"]]
-        elif selected == 10:
+        elif row == 10:
             idx = LYRIC_FONTS.index(SETTINGS["lyric_font"])
             SETTINGS["lyric_font"] = LYRIC_FONTS[(idx + direction) % len(LYRIC_FONTS)]
             return "Preview: " + font_preview(SETTINGS["lyric_font"])
-        elif selected == 11:
+        elif row == 11:
             SETTINGS["show_title"] = not SETTINGS["show_title"]
-        elif selected == 12:
+        elif row == 12:
             new_value = round(max(0.10, min(1.0, SETTINGS["opacity"] + direction * 0.05)), 2)
             SETTINGS["opacity"] = new_value
             if not kitty_opacity(new_value):
                 return "Kitty opacity unavailable - check Kitty remote-control settings"
             return "Kitty opacity updated"
-        elif selected == 13:
+        elif row == 13:
             SETTINGS["audio_enabled"] = not SETTINGS["audio_enabled"]
             if audio_dsp is not None:
                 if SETTINGS["audio_enabled"]:
@@ -1191,29 +1404,29 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
                 audio_dsp.stop()
                 return "Audio processing disabled - original routing restored"
             return None
-        elif selected == 14:
+        elif row == 14:
             SETTINGS["audio_volume"] = max(0, min(150, SETTINGS["audio_volume"] + direction * 5))
-        elif selected == 15:
+        elif row == 15:
             SETTINGS["audio_bass"] = round(max(0.0, min(12.0, SETTINGS["audio_bass"] + direction * 0.5)), 1)
-        elif selected == 16:
+        elif row == 16:
             SETTINGS["audio_mid"] = round(max(-12.0, min(12.0, SETTINGS["audio_mid"] + direction * 0.5)), 1)
-        elif selected == 17:
+        elif row == 17:
             SETTINGS["audio_treble"] = round(max(-12.0, min(12.0, SETTINGS["audio_treble"] + direction * 0.5)), 1)
-        elif selected in (18, 19, 20, 21, 22):
+        elif row in (18, 19, 20, 21, 22):
             eq_keys = ["audio_eq_60", "audio_eq_230", "audio_eq_910", "audio_eq_3640", "audio_eq_14000"]
-            eq_key = eq_keys[selected - 18]
+            eq_key = eq_keys[row - 18]
             SETTINGS[eq_key] = round(max(-12.0, min(12.0, SETTINGS[eq_key] + direction * 0.5)), 1)
-        elif selected == 23:
+        elif row == 23:
             SETTINGS["reflection"] = not SETTINGS["reflection"]
-        elif selected == 24:
+        elif row == 24:
             SETTINGS["reflection_strength"] = round(max(0.1, min(1.0, SETTINGS["reflection_strength"] + direction * 0.05)), 2)
-        elif selected == 25:
+        elif row == 25:
             SETTINGS["reflection_length"] = round(max(0.2, min(1.0, SETTINGS["reflection_length"] + direction * 0.05)), 2)
-        elif selected == 26:
+        elif row == 26:
             SETTINGS["water_distortion"] = round(max(0.0, min(1.0, SETTINGS["water_distortion"] + direction * 0.05)), 2)
-        if 23 <= selected <= 26 and SETTINGS["visualization"] != "Bars":
+        if 23 <= row <= 26 and SETTINGS["visualization"] != "Bars":
             return "The reflection only appears with the Bars visualization."
-        if 14 <= selected <= 22 and SETTINGS.get("audio_enabled") and audio_dsp is not None and audio_dsp.is_active():
+        if 14 <= row <= 22 and SETTINGS.get("audio_enabled") and audio_dsp is not None and audio_dsp.is_active():
             return "Audio DSP updated live"
         return None
 
@@ -1243,12 +1456,14 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
             elif key in DOWN:
                 selected = (selected + 1) % len(rows)
                 message = ""
-            elif 27 <= selected <= 31 and key in ("\r", "\n"):
+            elif selected == 14 and key in ("\r", "\n"):
+                message = audio_presets_menu()
+            elif 28 <= selected <= 32 and key in ("\r", "\n"):
                 if decoration_renderer is None:
                     message = "Decoration renderer is unavailable."
                 else:
-                    decoration_menu(selected - 27, decoration_renderer)
-                    message = f"Decoration slot {selected - 26} settings closed."
+                    decoration_menu(selected - 28, decoration_renderer)
+                    message = f"Decoration slot {selected - 27} settings closed."
             elif selected == len(rows) - 1 and key in ("\r", "\n"):
                 if update_checker is None:
                     message = "Update checker is unavailable."
