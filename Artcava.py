@@ -50,7 +50,7 @@ from PIL import Image
 RATE = 44100
 FFT_SIZE = 2048
 N_FFT = 4096
-FPS = 120
+FPS = 60
 FREQ_LO, FREQ_HI = 40, 12000
 BAR_W, GAP = 2, 1
 ATTACK_TIME = 0.028
@@ -89,10 +89,6 @@ COLOR_PRESETS = {
     "White": [(130, 145, 165), (210, 220, 235), (255, 255, 255)],
     # Soft periwinkle, lavender, blush pink, and misty aqua.
     "Dreamy": [(120, 105, 220), (175, 150, 245), (245, 175, 220), (145, 210, 235)],
-    # Seasonal holiday palettes.
-    "Halloween": [(255, 117, 24), (20, 12, 28), (120, 55, 170), (255, 170, 55)],
-    "Christmas": [(190, 25, 45), (20, 125, 65), (245, 245, 235), (205, 165, 75)],
-    "Valentine's Day": [(225, 25, 85), (255, 90, 150), (255, 175, 205), (145, 15, 65)],
 }
 
 DEFAULTS = {
@@ -116,8 +112,6 @@ DEFAULTS = {
     # How the synced lyrics are animated and styled.
     "lyric_animation": "Lively",
     "lyric_font": "Normal",
-    # User-created RGB palettes, stored directly in settings.json.
-    "custom_color_themes": {},
 }
 
 DEFAULT_DECORATIONS = [
@@ -160,35 +154,7 @@ def load_settings():
         if key in saved:
             SETTINGS[key] = saved[key]
 
-    # Validate custom palettes independently so one malformed entry cannot
-    # prevent Artcava from loading the rest of the user's settings.
-    raw_custom = saved.get("custom_color_themes", {})
-    custom = {}
-    if isinstance(raw_custom, dict):
-        reserved = {name.casefold() for name in COLOR_PRESETS}
-        for raw_name, raw_colors in raw_custom.items():
-            if not isinstance(raw_name, str):
-                continue
-            name = raw_name.strip()[:40]
-            if not name or name.casefold() in reserved or name.casefold() in {n.casefold() for n in custom}:
-                continue
-            if not isinstance(raw_colors, list) or not 2 <= len(raw_colors) <= 8:
-                continue
-            palette = []
-            valid = True
-            for color in raw_colors:
-                if not isinstance(color, (list, tuple)) or len(color) != 3:
-                    valid = False
-                    break
-                if any(type(channel) is not int or not 0 <= channel <= 255 for channel in color):
-                    valid = False
-                    break
-                palette.append(list(color))
-            if valid:
-                custom[name] = palette
-    SETTINGS["custom_color_themes"] = custom
-
-    if not isinstance(SETTINGS["color_mode"], str) or SETTINGS["color_mode"] not in COLOR_PRESETS and SETTINGS["color_mode"] not in custom:
+    if not isinstance(SETTINGS["color_mode"], str) or SETTINGS["color_mode"] not in COLOR_PRESETS:
         SETTINGS["color_mode"] = DEFAULTS["color_mode"]
 
     # Older settings files, including files with removed experimental modes,
@@ -246,154 +212,8 @@ def save_settings():
 
 
 def active_palette(album_palette):
-    """Return the selected built-in, custom, or live album-art palette."""
-    mode = SETTINGS.get("color_mode", DEFAULTS["color_mode"])
-    custom = SETTINGS.get("custom_color_themes", {})
-    if mode in custom:
-        return [tuple(color) for color in custom[mode]]
-    preset = COLOR_PRESETS.get(mode)
+    preset = COLOR_PRESETS[SETTINGS["color_mode"]]
     return album_palette if preset is None else preset
-
-
-def color_theme_names():
-    """Built-in themes followed by the user's saved custom themes."""
-    return list(COLOR_PRESETS) + list(SETTINGS.get("custom_color_themes", {}))
-
-
-def palette_preview(colors):
-    """Render small true-color swatches for a palette in the terminal."""
-    return " ".join(
-        f"\x1b[48;2;{r};{g};{b}m   \x1b[0m"
-        for r, g, b in colors
-    )
-
-
-def prompt_text(prompt, max_length=40):
-    """Read a normal echoed line while temporarily restoring canonical terminal input."""
-    fd = sys.stdin.fileno()
-    try:
-        previous = termios.tcgetattr(fd)
-        canonical = list(previous)
-        canonical[3] |= termios.ICANON | termios.ECHO
-        termios.tcsetattr(fd, termios.TCSADRAIN, canonical)
-        try:
-            value = input(prompt)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, previous)
-    except (termios.error, OSError, EOFError):
-        return ""
-    return value.strip()[:max_length]
-
-
-def custom_color_theme_menu(art_watcher=None):
-    """Save, select, rename, and delete custom palettes."""
-    selected = 0
-    message = ""
-
-    def live_palette():
-        album = art_watcher.palette if art_watcher is not None else DEFAULT_PALETTE
-        return [tuple(int(channel) for channel in color) for color in active_palette(album)]
-
-    while True:
-        names = list(SETTINGS.get("custom_color_themes", {}))
-        rows = ["Save current visualizer colors"] + names + ["Back"]
-        selected = max(0, min(selected, len(rows) - 1))
-        preview = palette_preview(live_palette())
-        out = [
-            "\x1b[2J\x1b[H\x1b[1;36m A R T C A V A / CUSTOM COLOR THEMES\x1b[0m\n\n",
-            " Colors currently used by the visualizer: " + preview + "\n\n",
-        ]
-        if not names:
-            out.append(" No custom themes saved yet.\n\n")
-        for index, label in enumerate(rows):
-            value = "Save palette" if index == 0 else ("Back" if index == len(rows) - 1 else "Saved theme")
-            marker = "\x1b[1;36m ❯ " if index == selected else "   "
-            end = "\x1b[0m" if index == selected else ""
-            out.append(f"{marker}{label:<34} {value:>14}{end}\n")
-            if 0 < index < len(rows) - 1:
-                out.append("     " + palette_preview(SETTINGS["custom_color_themes"].get(label, [])) + "\n")
-        if message:
-            out.append("\n " + message + "\n")
-        out.append("\n Enter select/save   R rename highlighted   D delete highlighted   Esc back\n")
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
-
-        for key in read_keys():
-            if key in UP:
-                selected = (selected - 1) % len(rows)
-                message = ""
-            elif key in DOWN:
-                selected = (selected + 1) % len(rows)
-                message = ""
-            elif key in ("\x1b", "q", "Q"):
-                save_settings()
-                return
-            elif selected == 0 and key in ("\r", "\n", "s", "S"):
-                palette = live_palette()
-                name = prompt_text("Name this color theme: ", 40)
-                if not name:
-                    message = "Theme name was empty or input was cancelled."
-                    continue
-                reserved = {item.casefold() for item in COLOR_PRESETS}
-                existing = {item.casefold(): item for item in SETTINGS["custom_color_themes"]}
-                if name.casefold() in reserved:
-                    message = "That name is already used by a built-in theme."
-                    continue
-                old_name = existing.get(name.casefold())
-                if old_name and old_name != name:
-                    SETTINGS["custom_color_themes"].pop(old_name, None)
-                SETTINGS["custom_color_themes"][name] = [list(color) for color in palette]
-                SETTINGS["color_mode"] = name
-                save_settings()
-                names = list(SETTINGS["custom_color_themes"])
-                selected = names.index(name) + 1
-                message = f'Saved and selected "{name}".'
-                break
-            elif 0 < selected < len(rows) - 1 and key in ("\r", "\n"):
-                name = names[selected - 1]
-                SETTINGS["color_mode"] = name
-                save_settings()
-                message = f'Selected "{name}".'
-                break
-            elif 0 < selected < len(rows) - 1 and key in ("r", "R"):
-                old_name = names[selected - 1]
-                new_name = prompt_text(f'Rename "{old_name}" to: ', 40)
-                if not new_name:
-                    message = "Theme name was empty or input was cancelled."
-                    continue
-                reserved = {item.casefold() for item in COLOR_PRESETS}
-                if new_name.casefold() in reserved:
-                    message = "That name is already used by a built-in theme."
-                    continue
-                if new_name.casefold() != old_name.casefold() and any(
-                    item.casefold() == new_name.casefold() for item in names
-                ):
-                    message = "A custom theme with that name already exists."
-                    continue
-                SETTINGS["custom_color_themes"][new_name] = SETTINGS["custom_color_themes"].pop(old_name)
-                if SETTINGS["color_mode"] == old_name:
-                    SETTINGS["color_mode"] = new_name
-                save_settings()
-                selected = names.index(old_name) + 1
-                message = f'Renamed to "{new_name}".'
-                break
-            elif 0 < selected < len(rows) - 1 and key in ("d", "D"):
-                name = names[selected - 1]
-                confirmation = prompt_text(f'Type DELETE to remove "{name}": ', 10)
-                if confirmation == "DELETE":
-                    SETTINGS["custom_color_themes"].pop(name, None)
-                    if SETTINGS["color_mode"] == name:
-                        SETTINGS["color_mode"] = DEFAULTS["color_mode"]
-                    save_settings()
-                    selected = max(0, selected - 1)
-                    message = f'Deleted "{name}".'
-                else:
-                    message = "Deletion cancelled."
-                break
-            elif selected == len(rows) - 1 and key in ("\r", "\n"):
-                save_settings()
-                return
-
 
 
 # --------------------------------------------------------------- Kitty --
@@ -987,10 +807,223 @@ def update_notice_mouse_action(key, cols, lines):
 
 
 # --------------------------------------------------------------- menu --
-def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer=None, art_watcher=None):
-    """Display and edit Artcava's settings, including custom themes and decorations."""
+# How the settings screen is drawn. Pure drawing code: what each row does lives in settings_menu().
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_RESET = "\x1b[0m"
+_TEXT, _BRIGHT, _MUTED, _GREEN, _TRACK = (200, 205, 218), (236, 239, 248), (112, 116, 135), (110, 225, 150), (70, 74, 92)
+
+# Rows are grouped into sections; each entry is the index of the first row in that section.
+SETTINGS_SECTIONS = {0: "LOOK", 7: "LYRICS & TITLE", 12: "WINDOW", 13: "WATER REFLECTION",
+                     17: "DECORATIONS", 22: "UPDATES"}
+SETTINGS_HELP = [
+    "Bar colors. 'Album art' follows the cover; the others are fixed palettes.",           # 0  Color theme
+    "Bars rise from the bottom. Mirror grows outward from the middle.",                    # 1  Visualization
+    "How many columns wide each bar is.",                                                  # 2  Bar width
+    "Empty columns between the bars.",                                                     # 3  Bar spacing
+    "How strongly the bars react to the music.",                                           # 4  Sensitivity
+    "How slowly the bars fall back down. Higher is smoother.",                             # 5  Bar smoothing
+    "How much the bars brighten on a beat.",                                               # 6  Beat flash
+    "Show synced lyrics under the bars (looked up on LRCLIB).",                            # 7  Lyrics
+    "Show lyrics earlier (+) or later (-). The [ and ] keys do the same.",                 # 8  Lyrics timing
+    "How lyric lines move: fade, slide, karaoke fill, or all of it.",                      # 9  Lyric animation
+    "Restyles the lyric text. Some styles need a font with math symbols.",                 # 10 Lyric font
+    "Show the song title, progress bar and playback buttons at the top.",                  # 11 Song title
+    "Window transparency. Kitty only, with remote control enabled.",                       # 12 Opacity
+    "Mirror the bars in water underneath them (Bars visualization only).",                 # 13 Reflection
+    "How visible the reflection is.",                                                      # 14 Reflection strength
+    "How far the reflection reaches below the bars.",                                      # 15 Reflection length
+    "How much the reflection ripples. 0% is a still mirror.",                              # 16 Water distortion
+] + ["Show an image or GIF on screen, then drag it where you want it. Kitty only."] * 5 + [  # 17-21 Decorations
+    "Compare this copy of Artcava with the latest version on GitHub.",                     # 22 Check for updates
+]
+
+
+def _vis_len(text):
+    """Width of a string on screen, ignoring color codes."""
+    return text_width(_ANSI_RE.sub("", text))
+
+
+def _bg(color):
+    return f"\x1b[48;2;{color[0]};{color[1]};{color[2]}m"
+
+
+def _clip(text, width):
+    """Trim a styled string to `width` columns; color codes are kept and not counted."""
+    out, used = [], 0
+    for part in re.split(r"(\x1b\[[0-9;]*[A-Za-z])", text):
+        if not part:
+            continue
+        if part.startswith("\x1b["):
+            out.append(part)
+            continue
+        for ch in part:
+            w = char_width(ch)
+            if used + w > width:
+                return "".join(out) + _RESET
+            out.append(ch)
+            used += w
+    return "".join(out)
+
+
+def _wrap(text, width, max_lines):
+    """Break text into lines of at most `width` columns (color codes allowed)."""
+    lines, current = [], ""
+    for word in text.split(" "):
+        trial = word if not current else current + " " + word
+        if _vis_len(trial) <= width:
+            current = trial
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines[:max_lines]
+
+
+def _slider(fraction, cells, accent):
+    """A small slider: filled part in the accent color, a bright knob, a dim track."""
+    pos = int(round(max(0.0, min(1.0, fraction)) * (cells - 1)))
+    return (_fg(accent) + "━" * pos + _fg(_WHITE) + "●"
+            + _fg(_TRACK) + "─" * (cells - 1 - pos))
+
+
+def settings_widget(i, accent, palette):
+    """The value column for settings row i, as colored text (foreground colors only)."""
+    s = SETTINGS
+
+    def choice(text):
+        return f"{_fg(_MUTED)}◂ {_fg(_BRIGHT)}{text} {_fg(_MUTED)}▸"
+
+    def pill(on):
+        return f"{_fg(_GREEN)}● On " if on else f"{_fg(_MUTED)}○ Off"
+
+    def meter(value, lo, hi, text, width=6):
+        return f"{_slider((value - lo) / (hi - lo), 8, accent)} {_fg(_BRIGHT)}{text:>{width}}"
+
+    if i == 0:
+        mode = s["color_mode"]
+        album = palette if palette is not None and len(palette) else DEFAULT_PALETTE
+        colors = album if COLOR_PRESETS[mode] is None else COLOR_PRESETS[mode]
+        swatch = "".join(_fg(tuple(int(v) for v in c)) + "██" for c in colors[:4])
+        return f"{_fg(_MUTED)}◂ {swatch} {_fg(_BRIGHT)}{mode} {_fg(_MUTED)}▸"
+    if i == 1:
+        return choice(s["visualization"])
+    if i == 2:
+        return choice(s["bar_width"])
+    if i == 3:
+        return choice(s["gap"])
+    if i == 4:
+        return meter(s["sensitivity"], 0.5, 2.5, f'{s["sensitivity"]:.1f}x')
+    if i == 5:
+        return meter(s["release_time"], 0.06, 0.5, f'{s["release_time"]:.2f}s')
+    if i == 6:
+        return meter(s["beat_flash"], 0.0, 1.0, f'{s["beat_flash"]:.2f}')
+    if i == 7:
+        return pill(s["lyrics"])
+    if i == 8:
+        return meter(s["lyrics_offset"], -5.0, 5.0, f'{s["lyrics_offset"]:+.2f}s')
+    if i == 9:
+        return choice(s["lyric_animation"])
+    if i == 10:
+        return choice(s["lyric_font"])
+    if i == 11:
+        return pill(s["show_title"])
+    if i == 12:
+        return meter(s["opacity"], 0.10, 1.0, f'{s["opacity"]:.2f}')
+    if i == 13:
+        return pill(s["reflection"])
+    if i == 14:
+        return meter(s["reflection_strength"], 0.10, 1.0, f'{s["reflection_strength"] * 100:.0f}%')
+    if i == 15:
+        return meter(s["reflection_length"], 0.20, 1.0, f'{s["reflection_length"] * 100:.0f}%')
+    if i == 16:
+        return meter(s["water_distortion"], 0.0, 1.0, f'{s["water_distortion"] * 100:.0f}%')
+    if 17 <= i <= 21:
+        path = s["decorations"][i - 17]["path"]
+        name = os.path.basename(path)[:14] if path else "Empty"
+        return f"{_fg(_BRIGHT if path else _MUTED)}{name} {_fg(_MUTED)}▸"
+    return f"{_fg(_BRIGHT)}Check now {_fg(_MUTED)}▸"
+
+
+def settings_screen(rows, selected, message, update_prompt, accent, palette, cols, lines):
+    """The whole settings screen as one string: a centered, bordered panel with sections."""
+    accent = tuple(int(c) for c in (accent if accent is not None else (105, 190, 255)))     # may be a numpy array
+    panel = min(cols, max(12, min(cols - 2, 72)))               # never wider than the window
+    inner = panel - 2
+    margin = " " * max(0, (cols - panel) // 2)
+    edge = _fg(_mix(accent, (0, 0, 0), 0.45))
+    select_bg = _bg(_mix((16, 18, 26), accent, 0.32))
+
+    def boxed(content, bg=""):
+        body = _clip(content, inner)
+        pad = " " * max(0, inner - _vis_len(body))
+        return f"{margin}{edge}│{_RESET}{bg}{body}{pad}{_RESET}{edge}│{_RESET}"
+
+    # What to show: section headings and rows, scrolled so the selected row stays in view.
+    display = []
+    for i in range(len(rows)):
+        if i in SETTINGS_SECTIONS:
+            display.append(("section", SETTINGS_SECTIONS[i]))
+        display.append(("row", i))
+    pos = display.index(("row", selected))
+    visible = max(5, min(len(display), lines - 9))
+    first = max(0, min(pos - visible // 2, len(display) - visible))
+    if first > 0 and display[first][0] == "row" and display[first - 1][0] == "section" and pos < first - 1 + visible:
+        first -= 1                                              # keep a section's heading with its first row
+    shown = display[first:first + visible]
+
+    out = []
+    title = " A R T C A V A  ·  S E T T I N G S "
+    top = _clip(title, max(0, inner - 2))
+    out.append(f"{margin}{edge}╭─{_RESET}\x1b[1m{_fg(accent)}{top}{_RESET}{edge}"
+               f"{'─' * max(0, inner - 1 - _vis_len(top))}╮{_RESET}")
+
+    for kind, value in shown:
+        if kind == "section":
+            fill = "─" * max(0, inner - 3 - len(value))
+            out.append(boxed(f" \x1b[1m{_fg(accent)}{value}\x1b[22m {edge}{fill}"))
+            continue
+        widget = settings_widget(value, accent, palette)
+        label_w = max(3, inner - 5 - _vis_len(widget))
+        label = fit(rows[value], label_w)
+        label += " " * (label_w - text_width(label))
+        if value == selected:
+            line = (f" {_fg(accent)}\x1b[1m❯\x1b[22m {_fg(_BRIGHT)}\x1b[1m{label}\x1b[22m {widget} ")
+            out.append(boxed(line, select_bg))
+        else:
+            out.append(boxed(f"   {_fg(_TEXT)}{label} {widget} "))
+
+    divider = f"{margin}{edge}├{'─' * inner}┤{_RESET}"
+    out.append(divider)
+    notes = []
+    if update_prompt:
+        notes.append(f" {_fg((255, 214, 120))}[U] Update now (copy link + open GitHub)   [X] Update later")
+    shade = _fg(_BRIGHT) if message else _fg(_MUTED)
+    text = message or (SETTINGS_HELP[selected] if selected < len(SETTINGS_HELP) else "")
+    notes += [" " + shade + line for line in _wrap(text, inner - 2, 3 - len(notes))]
+    for note in (notes + [""] * 3)[:3]:
+        out.append(boxed(note))
+    out.append(divider)
+
+    more_above, more_below = first > 0, first + visible < len(display)
+    counter = f"{'▲' if more_above else ' '}{'▼' if more_below else ' '} {selected + 1}/{len(rows)} "
+    hints = " ↑↓ move   ←→ change   Enter open   Esc close"
+    if _vis_len(hints) + len(counter) + 1 > inner:
+        hints = " ↑↓  ←→  Enter  Esc"
+    gap = " " * max(1, inner - _vis_len(hints) - len(counter))
+    out.append(boxed(f"{_fg(_MUTED)}{hints}{gap}{_fg(_MUTED)}{counter}"))
+    out.append(f"{margin}{edge}╰{'─' * inner}╯{_RESET}")
+
+    spare = lines - len(out)
+    pad_top = "\n" * (1 if spare > 2 else 0)
+    return "\x1b[2J\x1b[H" + pad_top + "\n".join(out)
+
+
+def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer=None, accent=None, palette=None):
+    """Display and edit Artcava's settings, including five decoration slots."""
     rows = [
-        "Color theme", "Custom color themes", "Visualization", "Bar width", "Bar spacing",
+        "Color theme", "Visualization", "Bar width", "Bar spacing",
         "Sensitivity", "Bar smoothing", "Beat flash", "Lyrics",
         "Lyrics timing", "Lyric animation", "Lyric font", "Song title", "Opacity",
         "Reflection", "Reflection strength", "Reflection length", "Water distortion",
@@ -998,108 +1031,62 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
         "Decoration slot 4", "Decoration slot 5", "Check for updates",
     ]
     selected = 0
-    help_text = "↑/↓ select   ←/→ change   Enter open/select   S/Esc close"
+    color_names = list(COLOR_PRESETS)
     update_prompt = False
-
-    def value_for(i):
-        values = [
-            SETTINGS["color_mode"], "Manage, save, rename, or delete palettes",
-            SETTINGS["visualization"],
-            str(SETTINGS["bar_width"]), str(SETTINGS["gap"]),
-            f'{SETTINGS["sensitivity"]:.1f}x',
-            f'{SETTINGS["release_time"]:.2f}s',
-            f'{SETTINGS["beat_flash"]:.2f}',
-            "On" if SETTINGS["lyrics"] else "Off",
-            f'{SETTINGS["lyrics_offset"]:+.2f}s',
-            SETTINGS["lyric_animation"],
-            SETTINGS["lyric_font"],
-            "On" if SETTINGS["show_title"] else "Off",
-            f'{SETTINGS["opacity"]:.2f}',
-            "On" if SETTINGS["reflection"] else "Off",
-            f'{SETTINGS["reflection_strength"] * 100:.0f}%',
-            f'{SETTINGS["reflection_length"] * 100:.0f}%',
-            f'{SETTINGS["water_distortion"] * 100:.0f}%',
-        ]
-        for decoration in SETTINGS["decorations"]:
-            path = decoration["path"]
-            values.append(os.path.basename(path)[:14] if path else "Empty")
-        values.append("Press Enter")
-        return values[i]
 
     def change(direction):
         if selected == 0:
-            color_names = color_theme_names()
             idx = color_names.index(SETTINGS["color_mode"])
             SETTINGS["color_mode"] = color_names[(idx + direction) % len(color_names)]
         elif selected == 1:
-            return "Press Enter to manage custom color themes."
-        elif selected == 2:
             idx = VISUALIZATIONS.index(SETTINGS["visualization"])
             SETTINGS["visualization"] = VISUALIZATIONS[(idx + direction) % len(VISUALIZATIONS)]
-        elif selected == 3:
+        elif selected == 2:
             SETTINGS["bar_width"] = max(1, min(4, SETTINGS["bar_width"] + direction))
-        elif selected == 4:
+        elif selected == 3:
             SETTINGS["gap"] = max(0, min(4, SETTINGS["gap"] + direction))
-        elif selected == 5:
+        elif selected == 4:
             SETTINGS["sensitivity"] = round(max(0.5, min(2.5, SETTINGS["sensitivity"] + direction * 0.1)), 1)
-        elif selected == 6:
+        elif selected == 5:
             SETTINGS["release_time"] = round(max(0.06, min(0.5, SETTINGS["release_time"] + direction * 0.02)), 2)
-        elif selected == 7:
+        elif selected == 6:
             SETTINGS["beat_flash"] = round(max(0.0, min(1.0, SETTINGS["beat_flash"] + direction * 0.05)), 2)
-        elif selected == 8:
+        elif selected == 7:
             SETTINGS["lyrics"] = not SETTINGS["lyrics"]
-        elif selected == 9:
+        elif selected == 8:
             SETTINGS["lyrics_offset"] = round(max(-5.0, min(5.0, SETTINGS["lyrics_offset"] + direction * 0.25)), 2)
-        elif selected == 10:
+        elif selected == 9:
             idx = LYRIC_ANIMATIONS.index(SETTINGS["lyric_animation"])
             SETTINGS["lyric_animation"] = LYRIC_ANIMATIONS[(idx + direction) % len(LYRIC_ANIMATIONS)]
             return LYRIC_ANIMATION_HELP[SETTINGS["lyric_animation"]]
-        elif selected == 11:
+        elif selected == 10:
             idx = LYRIC_FONTS.index(SETTINGS["lyric_font"])
             SETTINGS["lyric_font"] = LYRIC_FONTS[(idx + direction) % len(LYRIC_FONTS)]
             return "Preview: " + font_preview(SETTINGS["lyric_font"])
-        elif selected == 12:
+        elif selected == 11:
             SETTINGS["show_title"] = not SETTINGS["show_title"]
-        elif selected == 13:
+        elif selected == 12:
             new_value = round(max(0.10, min(1.0, SETTINGS["opacity"] + direction * 0.05)), 2)
             SETTINGS["opacity"] = new_value
             if not kitty_opacity(new_value):
                 return "Kitty opacity unavailable - check Kitty remote-control settings"
             return "Kitty opacity updated"
-        elif selected == 14:
+        elif selected == 13:
             SETTINGS["reflection"] = not SETTINGS["reflection"]
-        elif selected == 15:
+        elif selected == 14:
             SETTINGS["reflection_strength"] = round(max(0.1, min(1.0, SETTINGS["reflection_strength"] + direction * 0.05)), 2)
-        elif selected == 16:
+        elif selected == 15:
             SETTINGS["reflection_length"] = round(max(0.2, min(1.0, SETTINGS["reflection_length"] + direction * 0.05)), 2)
-        elif selected == 17:
+        elif selected == 16:
             SETTINGS["water_distortion"] = round(max(0.0, min(1.0, SETTINGS["water_distortion"] + direction * 0.05)), 2)
-        if 14 <= selected <= 17 and SETTINGS["visualization"] != "Bars":
+        if 13 <= selected <= 16 and SETTINGS["visualization"] != "Bars":
             return "The reflection only appears with the Bars visualization."
         return None
 
     message = ""
     while True:
-        out = [
-            "\x1b[2J\x1b[H\x1b[1;36m A R T C A V A / S E T T I N G S\x1b[0m\n\n",
-            " Navigate with arrow keys. Choose Custom color themes to save and manage palettes.\n\n",
-        ]
-        # Show only the rows that fit the window, keeping the selected row in view.
-        visible = max(6, shutil.get_terminal_size().lines - 11)
-        first = 0
-        if len(rows) > visible:
-            first = max(0, min(selected - visible // 2, len(rows) - visible))
-        for i in range(first, min(len(rows), first + visible)):
-            label = rows[i]
-            marker = "\x1b[1;36m ❯ " if i == selected else "   "
-            end = "\x1b[0m" if i == selected else ""
-            out.append(f"{marker}{label:<22} {value_for(i):>14}{end}\n")
-        if message:
-            out.append(f"\n {message}\n")
-        if update_prompt:
-            out.append("\n [U] Update now (copy link + open GitHub)   [X] Update later\n")
-        out.append("\n " + help_text + "\n")
-        sys.stdout.write("".join(out))
+        cols, lines = shutil.get_terminal_size()
+        sys.stdout.write(settings_screen(rows, selected, message, update_prompt, accent, palette, cols, lines))
         sys.stdout.flush()
 
         for key in read_keys():
@@ -1122,15 +1109,12 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
             elif key in DOWN:
                 selected = (selected + 1) % len(rows)
                 message = ""
-            elif selected == 1 and key in ("\r", "\n"):
-                custom_color_theme_menu(art_watcher)
-                message = "Custom color themes closed."
-            elif 18 <= selected <= 22 and key in ("\r", "\n"):
+            elif 17 <= selected <= 21 and key in ("\r", "\n"):
                 if decoration_renderer is None:
                     message = "Decoration renderer is unavailable."
                 else:
-                    decoration_menu(selected - 18, decoration_renderer)
-                    message = f"Decoration slot {selected - 17} settings closed."
+                    decoration_menu(selected - 17, decoration_renderer)
+                    message = f"Decoration slot {selected - 16} settings closed."
             elif selected == len(rows) - 1 and key in ("\r", "\n"):
                 if update_checker is None:
                     message = "Update checker is unavailable."
@@ -2183,6 +2167,7 @@ def main():
     tty.setcbreak(sys.stdin.fileno())
 
     current = None
+    accent = (105, 190, 255)          # lighter shade of the album color, updated every frame
     last = time.perf_counter()
     next_t = last
     quit_requested = False
@@ -2249,7 +2234,8 @@ def main():
                     continue
                 if key in ("s", "S"):
                     seekbar.cancel(lyrics)
-                    settings_menu(update_checker, update_ui_state, decoration_renderer, watcher)
+                    settings_menu(update_checker, update_ui_state, decoration_renderer,
+                                  accent=accent, palette=watcher.palette)
                     decoration_renderer.invalidate()
                     size = None
                     next_t = last = time.perf_counter()
