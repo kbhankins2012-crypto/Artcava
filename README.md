@@ -9,7 +9,7 @@ Designed for the **Kitty terminal**.
 
 ## Preview
 
-<img width="1908" height="1010" alt="image" src="https://github.com/user-attachments/assets/9eaece7a-f100-48ff-910b-7054f6f8b9be" />
+<img width="1920" height="1019" alt="image" src="https://github.com/user-attachments/assets/54f33e22-dea6-49df-b8f9-53667dfdd5a7" />
 
 
 **Disclaimer:** Not every album cover is gonna turn into colors perfectly. Some covers might look a little different in the visualizer, and that's completely normal. Artcava does its best to match the colors, but the results won't always be exact.
@@ -21,20 +21,24 @@ Designed for the **Kitty terminal**.
 - **Multiple visualization modes:** Switch between Bars and Mirror visualizations.
 - **Dynamic album-art colors:** Automatically extracts colors from the currently playing song's album artwork and applies them to the visualizer.
 - **Synced lyrics:** Displays synchronized lyrics for the currently playing song using LRCLIB.
+- **Animated lyrics:** Choose between Off, Fade, Slide, Karaoke, and Lively lyric animations.
+- **Customizable lyric fonts:** Choose from multiple lyric styles, including Normal, Bold, Italic, Script, Gothic, Double-struck, Monospace, Sans bold, Small caps, and Wide.
 - **Adjustable lyric timing:** Fine-tune lyric synchronization using `[` and `]`.
 - **Lyrics caching:** Saves fetched lyrics locally so they don't need to be downloaded again.
 - **Custom color presets:** Choose from multiple built-in color themes, including Dreamy, or use album-art colors.
 - **Beat flash:** Bars subtly react to bass and beats.
-- **Customizable settings:** Adjust visualization mode, bar width, spacing, sensitivity, smoothing, colors, lyrics, and opacity.
+- **Water reflection:** Adds a customizable mirrored water-reflection effect beneath Bars visualizations, with adjustable strength, length, and distortion.
+- **Customizable settings:** Adjust visualization mode, bar width, spacing, sensitivity, smoothing, colors, lyrics, animations, reflection, and opacity.
 - **Persistent configuration:** Your settings are saved automatically.
 - **True-color terminal support:** Uses RGB colors for a more vibrant terminal experience.
 - **Live playback controls:** Control your music with keyboard shortcuts or clickable on-screen controls.
 - **Now-playing information:** Displays the current song title, artist, and album.
-- **Song progress bar:** Shows playback progress with elapsed and total track time.
+- **Interactive song progress bar:** Displays elapsed and total track time, with draggable seeking to jump to any point in a song.
 - **Kitty transparency support:** Adjust terminal background opacity directly from Artcava's settings.
 - **Automatic update checker:** Checks GitHub for newer versions in the background when Artcava launches.
 - **Update notifications:** Displays a small notification when an update is available, with options to update or dismiss it.
 - **Quick update access:** Opens the GitHub README and copies the link so users can access the Quick Install command.
+- **Improved mouse input:** Uses smoother mouse handling for more reliable interactions with on-screen controls and draggable elements.
 
 ### Additional Controls
 
