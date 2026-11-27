@@ -60,6 +60,7 @@ import shutil
 import subprocess
 import sys
 import termios
+import tempfile
 import threading
 import time
 import tty
@@ -131,6 +132,7 @@ COLOR_PRESETS = {
 }
 
 DEFAULTS = {
+    "fps": FPS,
     "color_mode": "Album art",
     "visualization": "Bars",
     "bar_width": BAR_W,
@@ -178,6 +180,7 @@ SETTINGS = dict(DEFAULTS)
 SETTINGS["decorations"] = [dict(item) for item in DEFAULT_DECORATIONS]
 
 LIMITS = [
+    ("fps", 1, 120, int),
     ("bar_width", 1, 4, int),
     ("gap", 0, 4, int),
     ("sensitivity", 0.5, 2.5, float),
@@ -212,8 +215,7 @@ def load_settings():
         saved = {}
 
     for key in DEFAULTS:
-        if key in saved:
-            SETTINGS[key] = saved[key]
+        SETTINGS[key] = saved.get(key, DEFAULTS[key])
 
     if not isinstance(SETTINGS["color_mode"], str) or SETTINGS["color_mode"] not in COLOR_PRESETS:
         SETTINGS["color_mode"] = DEFAULTS["color_mode"]
@@ -264,12 +266,24 @@ def load_settings():
 
 
 def save_settings():
+    # Atomic replacement prevents the DSP process from reading a partial JSON file.
+    temp_path = None
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=CONFIG_DIR,
+                                         prefix=".settings-", delete=False) as f:
+            temp_path = f.name
             json.dump(SETTINGS, f, indent=2)
+        os.replace(temp_path, CONFIG_FILE)
+        temp_path = None
     except OSError:
         pass
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 def active_palette(album_palette):
@@ -1539,7 +1553,7 @@ def soft_clip(x, threshold=0.85, ceiling=0.98):
     return np.where(
         ax <= threshold,
         x,
-        np.sign(x) * (threshold + denom * (1.0 - np.exp(-(ax - threshold) / denom))),
+        np.sign(x) * (threshold + denom * (1.0 - np.exp(-np.maximum(ax - threshold, 0.0) / denom))),
     )
 
 
@@ -1645,6 +1659,16 @@ def read_dsp_params():
                     params[key] = saved[key]
     except (OSError, ValueError):
         pass
+    for key, lo, hi, cast in LIMITS:
+        if not key.startswith("audio_"):
+            continue
+        try:
+            value = cast(params[key])
+            if not math.isfinite(value):
+                raise ValueError
+            params[key] = max(lo, min(hi, value))
+        except (TypeError, ValueError, OverflowError):
+            params[key] = DEFAULTS[key]
     return params
 
 
@@ -1679,19 +1703,21 @@ def dsp_worker_main():
             data = stdin.read(hop_bytes)
             if not data:
                 break
-            if len(data) % 2:
-                data = data[:-1]
-            samples = np.frombuffer(data, dtype=np.int16).astype(np.float64) / 32768.0
+            # Drop a truncated final stereo frame, not just a single byte.
+            data = data[:len(data) - len(data) % (AUDIO_DSP_CHANNELS * 2)]
+            if not data:
+                break
+            samples = np.frombuffer(data, dtype="<i2").astype(np.float64) / 32768.0
             samples = samples.reshape(-1, AUDIO_DSP_CHANNELS)
             out = processor.process(samples)
             if len(out):
                 pcm = np.clip(out, -1.0, 1.0)
-                stdout.write((pcm * 32767.0).astype(np.int16).tobytes())
+                stdout.write((pcm * 32767.0).astype("<i2").tobytes())
                 stdout.flush()
         tail = processor.flush()
         if len(tail):
             pcm = np.clip(tail, -1.0, 1.0)
-            stdout.write((pcm * 32767.0).astype(np.int16).tobytes())
+            stdout.write((pcm * 32767.0).astype("<i2").tobytes())
             stdout.flush()
     except (BrokenPipeError, KeyboardInterrupt):
         pass
@@ -1740,16 +1766,37 @@ def _pactl_sink_exists(name):
     return False
 
 
-def _pactl_sink_input_ids():
-    rc, out, _err = _run_pactl(["list", "short", "sink-inputs"])
-    ids = []
+def _pactl_source_exists(name):
+    rc, out, _err = _run_pactl(["list", "short", "sources"])
     if rc != 0:
-        return ids
+        return False
+    return any(len(parts) >= 2 and parts[1].strip() == name
+               for parts in (line.split("\t") for line in out.splitlines()))
+
+
+def _pactl_sinks():
+    rc, out, _err = _run_pactl(["list", "short", "sinks"])
+    if rc != 0:
+        return None
+    sinks = {}
     for line in out.splitlines():
         parts = line.split("\t")
-        if parts and parts[0].strip().isdigit():
-            ids.append(parts[0].strip())
-    return ids
+        if len(parts) >= 2 and parts[0].strip().isdigit():
+            sinks[parts[1].strip()] = parts[0].strip()
+    return sinks
+
+
+def _pactl_sink_inputs():
+    """Return (stream id, sink index), or None on server failure."""
+    rc, out, _err = _run_pactl(["list", "short", "sink-inputs"])
+    if rc != 0:
+        return None
+    inputs = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0].strip().isdigit() and parts[1].strip().isdigit():
+            inputs.append((parts[0].strip(), parts[1].strip()))
+    return inputs
 
 
 class AudioDSPManager:
@@ -1767,9 +1814,10 @@ class AudioDSPManager:
         self.parec_proc = None
         self.worker_proc = None
         self.paplay_proc = None
+        self.proc_logs = {}
         self.monitor_thread = None
         self.stop_event = threading.Event()
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.last_error = ""
         self.status = "off"
 
@@ -1788,41 +1836,62 @@ class AudioDSPManager:
                      f"--channels={AUDIO_DSP_CHANNELS}", "--latency-msec=20"]
         worker_cmd = [sys.executable, os.path.realpath(__file__), "--dsp-worker",
                       "--rate", str(AUDIO_DSP_RATE)]
-        paplay_cmd = ["paplay", f"--device={original_sink}",
+        paplay_cmd = ["paplay", "--raw", f"--device={original_sink}",
                       "--format=s16le", f"--rate={AUDIO_DSP_RATE}",
                       f"--channels={AUDIO_DSP_CHANNELS}", "--latency-msec=20"]
+        self.parec_proc = self.worker_proc = self.paplay_proc = None
+        self.proc_logs = {}
         try:
-            parec = subprocess.Popen(parec_cmd, stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL, bufsize=0)
-            worker = subprocess.Popen(worker_cmd, stdin=parec.stdout,
+            # Files avoid deadlocking a child on a full stderr pipe. Keep each
+            # process's error separately so cascading failures are diagnosable.
+            self.proc_logs = {name: tempfile.TemporaryFile(mode="w+b")
+                              for name in ("parec", "DSP worker", "paplay")}
+            parec = self.parec_proc = subprocess.Popen(parec_cmd, stdout=subprocess.PIPE,
+                                     stderr=self.proc_logs["parec"], bufsize=0)
+            worker = self.worker_proc = subprocess.Popen(worker_cmd, stdin=parec.stdout,
                                       stdout=subprocess.PIPE,
-                                      stderr=subprocess.DEVNULL, bufsize=0)
+                                      stderr=self.proc_logs["DSP worker"], bufsize=0)
             try:
                 parec.stdout.close()
             except Exception:
                 pass
-            paplay = subprocess.Popen(paplay_cmd, stdin=worker.stdout,
+            paplay = self.paplay_proc = subprocess.Popen(paplay_cmd, stdin=worker.stdout,
                                       stdout=subprocess.DEVNULL,
-                                      stderr=subprocess.DEVNULL, bufsize=0)
+                                      stderr=self.proc_logs["paplay"], bufsize=0)
             try:
                 worker.stdout.close()
             except Exception:
                 pass
         except OSError as exc:
             self.last_error = f"could not start DSP pipeline: {exc}"
+            self._stop_pipeline()
             return False
-        time.sleep(0.25)
-        for proc, name in ((parec, "parec"), (worker, "DSP worker"), (paplay, "paplay")):
-            if proc.poll() is not None:
-                self.last_error = f"DSP pipeline failed: {name} exited immediately"
-                for p in (paplay, worker, parec):
-                    try:
-                        p.terminate()
-                    except Exception:
-                        pass
-                return False
+        time.sleep(0.5)
+        failed = [(name, proc.poll()) for proc, name in
+                  ((parec, "parec"), (worker, "DSP worker"), (paplay, "paplay"))
+                  if proc.poll() is not None]
+        if failed:
+            self.last_error = self._pipeline_error("DSP pipeline failed", failed)
+            self._stop_pipeline()
+            return False
         self.parec_proc, self.worker_proc, self.paplay_proc = parec, worker, paplay
         return True
+
+    def _pipeline_error(self, summary, failed):
+        details = []
+        for name, code in failed:
+            text = ""
+            log = self.proc_logs.get(name)
+            if log is not None:
+                try:
+                    log.flush()
+                    log.seek(0, os.SEEK_END)
+                    log.seek(max(0, log.tell() - 2048))
+                    text = log.read().decode("utf-8", "replace").strip().replace("\n", "; ")
+                except (OSError, ValueError):
+                    pass
+            details.append(f"{name} (exit {code})" + (f": {text}" if text else ""))
+        return summary + ": " + " | ".join(details)
 
     def _stop_pipeline(self):
         for proc in (self.paplay_proc, self.worker_proc, self.parec_proc):
@@ -1844,19 +1913,31 @@ class AudioDSPManager:
                 except Exception:
                     pass
         self.parec_proc = self.worker_proc = self.paplay_proc = None
+        for log in self.proc_logs.values():
+            try:
+                log.close()
+            except OSError:
+                pass
+        self.proc_logs = {}
 
-    def _monitor_loop(self):
-        while not self.stop_event.wait(1.0):
-            if not self.active:
-                break
-            for proc, name in ((self.parec_proc, "parec"), (self.worker_proc, "DSP worker"),
-                               (self.paplay_proc, "paplay")):
-                if proc is not None and proc.poll() is not None:
-                    self.last_error = f"DSP pipeline stopped unexpectedly ({name} exited)"
+    def _monitor_loop(self, stop_event):
+        while not stop_event.wait(1.0):
+            failed = None
+            ended = [(name, proc.poll()) for proc, name in
+                     ((self.parec_proc, "parec"), (self.worker_proc, "DSP worker"),
+                      (self.paplay_proc, "paplay")) if proc is not None and proc.poll() is not None]
+            if ended:
+                failed = self._pipeline_error("DSP pipeline stopped unexpectedly", ended)
+            if not failed and self.original_sink and not _pactl_sink_exists(self.original_sink):
+                failed = "Original audio output disappeared or audio service stopped"
+            if failed:
+                with self.lock:
+                    if stop_event is not self.stop_event or stop_event.is_set():
+                        return
+                    self.last_error = failed
                     self.status = "error"
-                    # Restore routing from this thread; stop() skips joining itself.
                     self.stop()
-                    return
+                return
 
     def start(self):
         with self.lock:
@@ -1881,7 +1962,18 @@ class AudioDSPManager:
                 self.last_error = "default sink is already ArtcavaDSP (stale state?)"
                 self.status = "error"
                 return False
+            sinks = _pactl_sinks()
+            inputs = _pactl_sink_inputs()
+            if sinks is None or inputs is None or original not in sinks:
+                self.last_error = "could not enumerate sinks or playback streams"
+                self.status = "error"
+                return False
+            if AUDIO_DSP_SINK_NAME in sinks:
+                self.last_error = "ArtcavaDSP sink already exists; refusing to reuse it"
+                self.status = "error"
+                return False
             self.original_sink = original
+            original_index = sinks[original]
 
             rc, out, err = _run_pactl([
                 "load-module", "module-null-sink",
@@ -1894,18 +1986,22 @@ class AudioDSPManager:
                 self.status = "error"
                 self.original_sink = None
                 return False
-            try:
-                self.module_index = out.splitlines()[0].strip() if out else None
-            except Exception:
-                self.module_index = None
+            self.module_index = out.splitlines()[0].strip() if out else None
+            if not self.module_index or not self.module_index.isdigit():
+                self.last_error = "audio server did not return a module ID; check for a stale ArtcavaDSP sink"
+                self.status = "error"
+                self.original_sink = None
+                return False
 
-            # Wait briefly for the virtual sink to appear.
-            for _ in range(10):
-                if _pactl_sink_exists(AUDIO_DSP_SINK_NAME):
+            # Some servers publish the sink and its monitor asynchronously.
+            # Do not start parec until both are visible.
+            for _ in range(20):
+                if (_pactl_sink_exists(AUDIO_DSP_SINK_NAME) and
+                        _pactl_source_exists(f"{AUDIO_DSP_SINK_NAME}.monitor")):
                     break
-                time.sleep(0.2)
+                time.sleep(0.1)
             else:
-                self.last_error = "virtual sink did not appear after creation"
+                self.last_error = "virtual sink or monitor source did not appear after creation"
                 self._unload_virtual_sink()
                 self.status = "error"
                 self.original_sink = None
@@ -1922,14 +2018,15 @@ class AudioDSPManager:
             # Move streams that existed before DSP started. paplay has not
             # started yet, so there is no DSP output stream to exclude and
             # no feedback loop is possible at this point.
-            for input_id in _pactl_sink_input_ids():
-                _run_pactl(["move-sink-input", input_id, AUDIO_DSP_SINK_NAME], timeout=2)
+            for input_id, sink_index in inputs:
+                if sink_index == original_index:
+                    _run_pactl(["move-sink-input", input_id, AUDIO_DSP_SINK_NAME], timeout=2)
 
             if not self._start_pipeline(original):
                 # Roll back routing so the user still hears normal audio.
-                for input_id in _pactl_sink_input_ids():
-                    _run_pactl(["move-sink-input", input_id, original], timeout=2)
-                _run_pactl(["set-default-sink", original], timeout=2)
+                self._restore_streams(original)
+                if _pactl_default_sink() == AUDIO_DSP_SINK_NAME:
+                    _run_pactl(["set-default-sink", original], timeout=2)
                 self._unload_virtual_sink()
                 self.status = "error"
                 self.original_sink = None
@@ -1937,44 +2034,48 @@ class AudioDSPManager:
 
             self.active = True
             self.status = "active"
-            self.stop_event.clear()
-            self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+            self.stop_event = threading.Event()
+            self.monitor_thread = threading.Thread(target=self._monitor_loop,
+                                                   args=(self.stop_event,), daemon=True)
             self.monitor_thread.start()
             return True
+
+    def _restore_streams(self, target):
+        """Move only streams still on our virtual sink, never unrelated streams."""
+        sinks = _pactl_sinks()
+        inputs = _pactl_sink_inputs()
+        if sinks is None or inputs is None:
+            return
+        virtual_index = sinks.get(AUDIO_DSP_SINK_NAME)
+        if virtual_index is not None:
+            for input_id, sink_index in inputs:
+                if sink_index == virtual_index:
+                    _run_pactl(["move-sink-input", input_id, target], timeout=2)
 
     def _unload_virtual_sink(self):
         if self.module_index:
             _run_pactl(["unload-module", str(self.module_index)], timeout=2)
             self.module_index = None
-        elif _pactl_sink_exists(AUDIO_DSP_SINK_NAME):
-            # Fallback: unload by module name (PulseAudio accepts this).
-            _run_pactl(["unload-module", "module-null-sink"], timeout=2)
 
     def stop(self):
         with self.lock:
             was_active = self.active or self.module_index is not None
             self.stop_event.set()
-            if self.monitor_thread is not None and threading.current_thread() is not self.monitor_thread:
-                self.monitor_thread.join(timeout=2)
+            # Never join while holding this lock: the monitor may be waiting
+            # for it to perform an emergency rollback.
             self.monitor_thread = None
             self._stop_pipeline()
             original = self.original_sink
             if was_active and original:
-                # Pipeline is stopped first, so moving streams back cannot loop.
-                if _pactl_sink_exists(original):
-                    for input_id in _pactl_sink_input_ids():
-                        _run_pactl(["move-sink-input", input_id, original], timeout=2)
-                    _run_pactl(["set-default-sink", original], timeout=2)
-                else:
-                    # Original device vanished (e.g. unplugged): fall back to
-                    # the first remaining non-virtual sink as default.
-                    rc, out, _err = _run_pactl(["list", "short", "sinks"])
-                    if rc == 0:
-                        for line in out.splitlines():
-                            parts = line.split("\t")
-                            if len(parts) >= 2 and parts[1].strip() != AUDIO_DSP_SINK_NAME:
-                                _run_pactl(["set-default-sink", parts[1].strip()], timeout=2)
-                                break
+                sinks = _pactl_sinks()
+                target = original if sinks and original in sinks else None
+                if target is None and sinks:
+                    target = next((name for name in sinks if name != AUDIO_DSP_SINK_NAME), None)
+                if target:
+                    self._restore_streams(target)
+                    # Do not override a default selected by the user while active.
+                    if _pactl_default_sink() == AUDIO_DSP_SINK_NAME:
+                        _run_pactl(["set-default-sink", target], timeout=2)
                 self._unload_virtual_sink()
             self.active = False
             if self.status != "error":
@@ -2316,7 +2417,7 @@ def progress_line(watcher, cols, accent):
     r, g, b = (int(c) for c in accent)
     active = f"\x1b[1;38;2;{r};{g};{b}m"
     dim = "\x1b[38;2;105;105;120m"
-    marker_style = f"\x1b[1;38;2;255;255;255m"
+    marker_style = "\x1b[1;38;2;255;255;255m"
 
     content = (
         dim + elapsed_text + "  "
@@ -2927,6 +3028,20 @@ def main():
             if quit_requested:
                 break
 
+            if audio_dsp.status == "error" and not audio_dsp.is_active() and SETTINGS.get("audio_enabled"):
+                SETTINGS["audio_enabled"] = False
+                save_settings()
+                action_message = "Audio processing stopped: " + audio_dsp.last_error
+                action_message_until = time.monotonic() + 6.0
+                # Return the analyzer to normal routing after automatic rollback.
+                if reader.monitor != audio_dsp.expected_monitor():
+                    try:
+                        reader.proc.terminate()
+                        reader = AudioReader(monitor=audio_dsp.expected_monitor())
+                        reader.start()
+                    except OSError:
+                        pass
+
             seekbar.tick(lyrics)
             if lyrics.seek_failed:
                 lyrics.seek_failed = False
@@ -2986,7 +3101,7 @@ def main():
             decoration_renderer.draw(cols, lines)
             sys.stdout.flush()
 
-            next_t += 1 / FPS
+            next_t += 1 / SETTINGS["fps"]
             spare = next_t - time.perf_counter()
             if spare > 0:
                 time.sleep(spare)
