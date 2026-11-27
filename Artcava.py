@@ -159,6 +159,7 @@ DEFAULTS = {
     "audio_enabled": False,
     "audio_preset": "Custom",
     "audio_presets": {},
+    "audio_custom": None,
     "audio_volume": 100,
     "audio_bass": 0.0,
     "audio_mid": 0.0,
@@ -246,6 +247,9 @@ def current_audio_values():
 def preset_values(name):
     if name == "Flat":
         return {key: DEFAULTS[key] for key in AUDIO_PRESET_KEYS}
+    if name == "Custom":
+        # Old settings files have no saved custom snapshot yet.
+        return SETTINGS.get("audio_custom") or current_audio_values()
     return SETTINGS["audio_presets"].get(name)
 
 
@@ -256,6 +260,17 @@ def preset_label():
 
 
 def apply_audio_preset(name):
+    if name not in ("Flat", "Custom") and name not in SETTINGS["audio_presets"]:
+        return False
+    current = SETTINGS.get("audio_preset", "Custom")
+    if current == "Custom" and name == "Custom":
+        return True
+    # Preserve unsaved changes before switching away. Named presets themselves
+    # remain unchanged, and the previous sound can be recalled via Custom.
+    previous = current_audio_values()
+    stored = preset_values(current)
+    if current == "Custom" or (stored is not None and previous != stored):
+        SETTINGS["audio_custom"] = previous
     values = preset_values(name)
     if values is None:
         return False
@@ -266,7 +281,7 @@ def apply_audio_preset(name):
 
 
 def cycle_audio_preset(direction):
-    names = ["Flat"] + list(SETTINGS["audio_presets"])
+    names = ["Flat"] + list(SETTINGS["audio_presets"]) + ["Custom"]
     current = SETTINGS.get("audio_preset", "Custom")
     index = names.index(current) if current in names else (-1 if direction > 0 else 0)
     name = names[(index + direction) % len(names)]
@@ -295,6 +310,7 @@ def delete_audio_preset(name):
         return False
     del SETTINGS["audio_presets"][name]
     if SETTINGS["audio_preset"] == name:
+        SETTINGS["audio_custom"] = current_audio_values()
         SETTINGS["audio_preset"] = "Custom"
     save_settings()
     return True
@@ -354,6 +370,7 @@ def load_settings():
                 presets[name] = normalized_preset
                 seen_names.add(name.casefold())
     SETTINGS["audio_presets"] = presets
+    SETTINGS["audio_custom"] = normalize_preset(SETTINGS.get("audio_custom"))
     if SETTINGS.get("audio_preset") not in ("Flat", "Custom", *presets):
         SETTINGS["audio_preset"] = "Custom"
 
@@ -1021,7 +1038,7 @@ SETTINGS_HELP = [
     "Show the song title, progress bar and playback buttons at the top.",                  # 11 Song title
     "Window transparency. Kitty only, with remote control enabled.",                       # 12 Opacity
     "Route audio through Artcava DSP (virtual sink). Off = normal audio.",                 # 13 Audio processing
-    "Left/Right applies a preset. Enter opens save, overwrite and delete options.",       # 14 Audio presets
+    "Left/Right applies a preset; Custom recalls edits. Enter manages presets.",       # 14 Audio presets
     "Master output volume. 0-150%. Applies to the processed audio only.",                  # 14 Master volume
     "Boost low frequencies. 0 to +12 dB.",                                                 # 15 Bass boost
     "Adjust middle frequencies around 1 kHz. -12 to +12 dB.",                              # 16 Midrange
@@ -1276,7 +1293,7 @@ def audio_presets_menu():
     rows = ("Choose preset", "Save current settings as new", "Overwrite selected preset",
             "Delete selected preset", "Back")
     selected = 0
-    message = "Left/Right switches and applies a preset. * means edited since saving."
+    message = "Left/Right switches presets; Custom recalls edits. * means modified."
     confirm_delete = False
     while True:
         cols, _lines = shutil.get_terminal_size()
