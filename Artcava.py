@@ -7,6 +7,8 @@ Audio : captured from your default output's monitor via `parec`
 Art   : read from MPRIS via `playerctl`
 
 Deps  : python3-numpy, python3-pil, playerctl, pulseaudio-utils
+        (Audio DSP additionally needs pactl/parec/paplay from
+         pulseaudio-utils or PipeWire's pipewire-pulse; no extra Python deps)
 
 Keys  : S = settings   Q = quit   L = lyrics on/off   T = song title on/off
         A = previous track   Space = pause/resume   D = next track
@@ -15,6 +17,27 @@ Keys  : S = settings   Q = quit   L = lyrics on/off   T = song title on/off
         Water reflection = Settings > Reflection (Bars visualization)
         Click or drag the progress bar = jump to any point in the song
         Lyric animation and lyric font = Settings
+        Audio DSP = Settings > Audio (master volume, bass, mid, treble, 5-band EQ).
+                    All audio controls live only in Settings; the main
+                    visualizer screen is unchanged.
+
+Audio DSP (Settings > Audio):
+    When enabled, Artcava creates a temporary virtual sink named
+    "artcava_dsp" (PulseAudio module-null-sink / PipeWire equivalent),
+    moves existing playback streams to it, makes it the default sink so
+    new streams also route through it, and runs a processing pipeline:
+
+        parec (artcava_dsp.monitor) -> Artcava --dsp-worker -> paplay (original sink)
+
+    The worker applies master volume, bass/mid/treble and a 5-band EQ
+    in the frequency domain (numpy FFT, stereo, soft limiter to prevent
+    clipping) and plays the result to your original output device.
+    The visualizer then taps the original sink's monitor, so it shows
+    the *processed* audio. On disable or exit, streams are moved back,
+    the original default sink is restored, and the virtual sink is
+    unloaded. No permanent system configuration is changed.
+    If pactl/parec/paplay are missing or the virtual sink cannot be
+    created, DSP stays off and the visualizer keeps working normally.
 
 Kitty transparency:
     Add these to ~/.config/kitty/kitty.conf:
@@ -29,6 +52,7 @@ import colorsys
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import select
@@ -62,6 +86,21 @@ BLOCKS = " ▁▂▃▄▅▆▇█"
 DEFAULT_PALETTE = [(80, 160, 255), (200, 90, 255), (255, 90, 160)]
 CONFIG_DIR = os.path.expanduser("~/.config/artcava")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.json")
+
+# Audio DSP constants. The DSP worker runs at 48 kHz stereo regardless of
+# the visualizer's 44.1 kHz mono tap; PulseAudio/PipeWire resamples as needed.
+AUDIO_DSP_RATE = 48000
+AUDIO_DSP_CHANNELS = 2
+AUDIO_DSP_FFT_SIZE = 4096
+AUDIO_DSP_HOP = 2048
+AUDIO_DSP_SINK_NAME = "artcava_dsp"
+AUDIO_EQ_BANDS = [
+    ("audio_eq_60", 60.0, "EQ 60 Hz"),
+    ("audio_eq_230", 230.0, "EQ 230 Hz"),
+    ("audio_eq_910", 910.0, "EQ 910 Hz"),
+    ("audio_eq_3640", 3640.0, "EQ 3.6 kHz"),
+    ("audio_eq_14000", 14000.0, "EQ 14 kHz"),
+]
 
 VISUALIZATIONS = ("Bars", "Mirror")
 LYRIC_ANIMATIONS = ("Off", "Fade", "Slide", "Karaoke", "Lively")
@@ -112,6 +151,19 @@ DEFAULTS = {
     # How the synced lyrics are animated and styled.
     "lyric_animation": "Lively",
     "lyric_font": "Normal",
+    # Audio DSP (Settings > Audio). Off by default so existing users are
+    # not surprised by routing changes after updating. Values persist in
+    # settings.json; missing keys (old settings files) get these defaults.
+    "audio_enabled": False,
+    "audio_volume": 100,
+    "audio_bass": 0.0,
+    "audio_mid": 0.0,
+    "audio_treble": 0.0,
+    "audio_eq_60": 0.0,
+    "audio_eq_230": 0.0,
+    "audio_eq_910": 0.0,
+    "audio_eq_3640": 0.0,
+    "audio_eq_14000": 0.0,
 }
 
 DEFAULT_DECORATIONS = [
@@ -136,6 +188,15 @@ LIMITS = [
     ("reflection_strength", 0.10, 1.0, float),
     ("reflection_length", 0.20, 1.0, float),
     ("water_distortion", 0.0, 1.0, float),
+    ("audio_volume", 0, 150, int),
+    ("audio_bass", 0.0, 12.0, float),
+    ("audio_mid", -12.0, 12.0, float),
+    ("audio_treble", -12.0, 12.0, float),
+    ("audio_eq_60", -12.0, 12.0, float),
+    ("audio_eq_230", -12.0, 12.0, float),
+    ("audio_eq_910", -12.0, 12.0, float),
+    ("audio_eq_3640", -12.0, 12.0, float),
+    ("audio_eq_14000", -12.0, 12.0, float),
 ]
 
 
@@ -167,7 +228,7 @@ def load_settings():
     if SETTINGS.get("lyric_font") not in LYRIC_FONTS:
         SETTINGS["lyric_font"] = DEFAULTS["lyric_font"]
 
-    for flag in ("lyrics", "show_title", "reflection"):
+    for flag in ("lyrics", "show_title", "reflection", "audio_enabled"):
         if not isinstance(SETTINGS[flag], bool):
             SETTINGS[flag] = DEFAULTS[flag]
 
@@ -214,6 +275,7 @@ def save_settings():
 def active_palette(album_palette):
     preset = COLOR_PRESETS[SETTINGS["color_mode"]]
     return album_palette if preset is None else preset
+
 
 
 # --------------------------------------------------------------- Kitty --
@@ -813,8 +875,9 @@ _RESET = "\x1b[0m"
 _TEXT, _BRIGHT, _MUTED, _GREEN, _TRACK = (200, 205, 218), (236, 239, 248), (112, 116, 135), (110, 225, 150), (70, 74, 92)
 
 # Rows are grouped into sections; each entry is the index of the first row in that section.
-SETTINGS_SECTIONS = {0: "LOOK", 7: "LYRICS & TITLE", 12: "WINDOW", 13: "WATER REFLECTION",
-                     17: "DECORATIONS", 22: "UPDATES"}
+# Audio rows (13-22) live only here in Settings; the main visualizer screen is unchanged.
+SETTINGS_SECTIONS = {0: "LOOK", 7: "LYRICS & TITLE", 12: "WINDOW", 13: "AUDIO",
+                     23: "WATER REFLECTION", 27: "DECORATIONS", 32: "UPDATES"}
 SETTINGS_HELP = [
     "Bar colors. 'Album art' follows the cover; the others are fixed palettes.",           # 0  Color theme
     "Bars rise from the bottom. Mirror grows outward from the middle.",                    # 1  Visualization
@@ -829,12 +892,22 @@ SETTINGS_HELP = [
     "Restyles the lyric text. Some styles need a font with math symbols.",                 # 10 Lyric font
     "Show the song title, progress bar and playback buttons at the top.",                  # 11 Song title
     "Window transparency. Kitty only, with remote control enabled.",                       # 12 Opacity
-    "Mirror the bars in water underneath them (Bars visualization only).",                 # 13 Reflection
-    "How visible the reflection is.",                                                      # 14 Reflection strength
-    "How far the reflection reaches below the bars.",                                      # 15 Reflection length
-    "How much the reflection ripples. 0% is a still mirror.",                              # 16 Water distortion
-] + ["Show an image or GIF on screen, then drag it where you want it. Kitty only."] * 5 + [  # 17-21 Decorations
-    "Compare this copy of Artcava with the latest version on GitHub.",                     # 22 Check for updates
+    "Route audio through Artcava DSP (virtual sink). Off = normal audio.",                 # 13 Audio processing
+    "Master output volume. 0-150%. Applies to the processed audio only.",                  # 14 Master volume
+    "Boost low frequencies. 0 to +12 dB.",                                                 # 15 Bass boost
+    "Adjust middle frequencies around 1 kHz. -12 to +12 dB.",                              # 16 Midrange
+    "Adjust high frequencies. -12 to +12 dB.",                                             # 17 Treble
+    "Equalizer band at 60 Hz. -12 to +12 dB.",                                             # 18 EQ 60 Hz
+    "Equalizer band at 230 Hz. -12 to +12 dB.",                                            # 19 EQ 230 Hz
+    "Equalizer band at 910 Hz. -12 to +12 dB.",                                            # 20 EQ 910 Hz
+    "Equalizer band at 3.6 kHz. -12 to +12 dB.",                                           # 21 EQ 3.6 kHz
+    "Equalizer band at 14 kHz. -12 to +12 dB.",                                            # 22 EQ 14 kHz
+    "Mirror the bars in water underneath them (Bars visualization only).",                 # 23 Reflection
+    "How visible the reflection is.",                                                      # 24 Reflection strength
+    "How far the reflection reaches below the bars.",                                      # 25 Reflection length
+    "How much the reflection ripples. 0% is a still mirror.",                              # 26 Water distortion
+] + ["Show an image or GIF on screen, then drag it where you want it. Kitty only."] * 5 + [  # 27-31 Decorations
+    "Compare this copy of Artcava with the latest version on GitHub.",                     # 32 Check for updates
 ]
 
 
@@ -932,15 +1005,35 @@ def settings_widget(i, accent, palette):
     if i == 12:
         return meter(s["opacity"], 0.10, 1.0, f'{s["opacity"]:.2f}')
     if i == 13:
-        return pill(s["reflection"])
+        return pill(s["audio_enabled"])
     if i == 14:
-        return meter(s["reflection_strength"], 0.10, 1.0, f'{s["reflection_strength"] * 100:.0f}%')
+        return meter(s["audio_volume"], 0, 150, f'{s["audio_volume"]}%')
     if i == 15:
-        return meter(s["reflection_length"], 0.20, 1.0, f'{s["reflection_length"] * 100:.0f}%')
+        return meter(s["audio_bass"], 0.0, 12.0, f'{s["audio_bass"]:+.1f} dB')
     if i == 16:
+        return meter(s["audio_mid"], -12.0, 12.0, f'{s["audio_mid"]:+.1f} dB')
+    if i == 17:
+        return meter(s["audio_treble"], -12.0, 12.0, f'{s["audio_treble"]:+.1f} dB')
+    if i == 18:
+        return meter(s["audio_eq_60"], -12.0, 12.0, f'{s["audio_eq_60"]:+.1f} dB')
+    if i == 19:
+        return meter(s["audio_eq_230"], -12.0, 12.0, f'{s["audio_eq_230"]:+.1f} dB')
+    if i == 20:
+        return meter(s["audio_eq_910"], -12.0, 12.0, f'{s["audio_eq_910"]:+.1f} dB')
+    if i == 21:
+        return meter(s["audio_eq_3640"], -12.0, 12.0, f'{s["audio_eq_3640"]:+.1f} dB')
+    if i == 22:
+        return meter(s["audio_eq_14000"], -12.0, 12.0, f'{s["audio_eq_14000"]:+.1f} dB')
+    if i == 23:
+        return pill(s["reflection"])
+    if i == 24:
+        return meter(s["reflection_strength"], 0.10, 1.0, f'{s["reflection_strength"] * 100:.0f}%')
+    if i == 25:
+        return meter(s["reflection_length"], 0.20, 1.0, f'{s["reflection_length"] * 100:.0f}%')
+    if i == 26:
         return meter(s["water_distortion"], 0.0, 1.0, f'{s["water_distortion"] * 100:.0f}%')
-    if 17 <= i <= 21:
-        path = s["decorations"][i - 17]["path"]
+    if 27 <= i <= 31:
+        path = s["decorations"][i - 27]["path"]
         name = os.path.basename(path)[:14] if path else "Empty"
         return f"{_fg(_BRIGHT if path else _MUTED)}{name} {_fg(_MUTED)}▸"
     return f"{_fg(_BRIGHT)}Check now {_fg(_MUTED)}▸"
@@ -1020,12 +1113,14 @@ def settings_screen(rows, selected, message, update_prompt, accent, palette, col
     return "\x1b[2J\x1b[H" + pad_top + "\n".join(out)
 
 
-def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer=None, accent=None, palette=None):
+def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer=None, accent=None, palette=None, audio_dsp=None):
     """Display and edit Artcava's settings, including five decoration slots."""
     rows = [
         "Color theme", "Visualization", "Bar width", "Bar spacing",
         "Sensitivity", "Bar smoothing", "Beat flash", "Lyrics",
         "Lyrics timing", "Lyric animation", "Lyric font", "Song title", "Opacity",
+        "Audio processing", "Master volume", "Bass boost", "Midrange", "Treble",
+        "EQ 60 Hz", "EQ 230 Hz", "EQ 910 Hz", "EQ 3.6 kHz", "EQ 14 kHz",
         "Reflection", "Reflection strength", "Reflection length", "Water distortion",
         "Decoration slot 1", "Decoration slot 2", "Decoration slot 3",
         "Decoration slot 4", "Decoration slot 5", "Check for updates",
@@ -1072,15 +1167,40 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
                 return "Kitty opacity unavailable - check Kitty remote-control settings"
             return "Kitty opacity updated"
         elif selected == 13:
-            SETTINGS["reflection"] = not SETTINGS["reflection"]
+            SETTINGS["audio_enabled"] = not SETTINGS["audio_enabled"]
+            if audio_dsp is not None:
+                if SETTINGS["audio_enabled"]:
+                    if audio_dsp.start():
+                        return "Audio processing enabled (virtual sink ArtcavaDSP)"
+                    SETTINGS["audio_enabled"] = False
+                    return f"Audio DSP failed: {audio_dsp.last_error or 'unknown error'}"
+                audio_dsp.stop()
+                return "Audio processing disabled - original routing restored"
+            return None
         elif selected == 14:
-            SETTINGS["reflection_strength"] = round(max(0.1, min(1.0, SETTINGS["reflection_strength"] + direction * 0.05)), 2)
+            SETTINGS["audio_volume"] = max(0, min(150, SETTINGS["audio_volume"] + direction * 5))
         elif selected == 15:
-            SETTINGS["reflection_length"] = round(max(0.2, min(1.0, SETTINGS["reflection_length"] + direction * 0.05)), 2)
+            SETTINGS["audio_bass"] = round(max(0.0, min(12.0, SETTINGS["audio_bass"] + direction * 0.5)), 1)
         elif selected == 16:
+            SETTINGS["audio_mid"] = round(max(-12.0, min(12.0, SETTINGS["audio_mid"] + direction * 0.5)), 1)
+        elif selected == 17:
+            SETTINGS["audio_treble"] = round(max(-12.0, min(12.0, SETTINGS["audio_treble"] + direction * 0.5)), 1)
+        elif selected in (18, 19, 20, 21, 22):
+            eq_keys = ["audio_eq_60", "audio_eq_230", "audio_eq_910", "audio_eq_3640", "audio_eq_14000"]
+            eq_key = eq_keys[selected - 18]
+            SETTINGS[eq_key] = round(max(-12.0, min(12.0, SETTINGS[eq_key] + direction * 0.5)), 1)
+        elif selected == 23:
+            SETTINGS["reflection"] = not SETTINGS["reflection"]
+        elif selected == 24:
+            SETTINGS["reflection_strength"] = round(max(0.1, min(1.0, SETTINGS["reflection_strength"] + direction * 0.05)), 2)
+        elif selected == 25:
+            SETTINGS["reflection_length"] = round(max(0.2, min(1.0, SETTINGS["reflection_length"] + direction * 0.05)), 2)
+        elif selected == 26:
             SETTINGS["water_distortion"] = round(max(0.0, min(1.0, SETTINGS["water_distortion"] + direction * 0.05)), 2)
-        if 13 <= selected <= 16 and SETTINGS["visualization"] != "Bars":
+        if 23 <= selected <= 26 and SETTINGS["visualization"] != "Bars":
             return "The reflection only appears with the Bars visualization."
+        if 14 <= selected <= 22 and SETTINGS.get("audio_enabled") and audio_dsp is not None and audio_dsp.is_active():
+            return "Audio DSP updated live"
         return None
 
     message = ""
@@ -1109,12 +1229,12 @@ def settings_menu(update_checker=None, update_ui_state=None, decoration_renderer
             elif key in DOWN:
                 selected = (selected + 1) % len(rows)
                 message = ""
-            elif 17 <= selected <= 21 and key in ("\r", "\n"):
+            elif 27 <= selected <= 31 and key in ("\r", "\n"):
                 if decoration_renderer is None:
                     message = "Decoration renderer is unavailable."
                 else:
-                    decoration_menu(selected - 17, decoration_renderer)
-                    message = f"Decoration slot {selected - 16} settings closed."
+                    decoration_menu(selected - 27, decoration_renderer)
+                    message = f"Decoration slot {selected - 26} settings closed."
             elif selected == len(rows) - 1 and key in ("\r", "\n"):
                 if update_checker is None:
                     message = "Update checker is unavailable."
@@ -1264,12 +1384,13 @@ class ArtWatcher(threading.Thread):
 
 # ---------------------------------------------------------------- audio --
 class AudioReader(threading.Thread):
-    def __init__(self):
+    def __init__(self, monitor="@DEFAULT_MONITOR@"):
         super().__init__(daemon=True)
+        self.monitor = monitor
         self.proc = subprocess.Popen(
             [
                 "parec", "--format=s16le", f"--rate={RATE}", "--channels=1",
-                "--latency-msec=10", "-d", "@DEFAULT_MONITOR@",
+                "--latency-msec=10", "-d", monitor,
             ],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
         )
@@ -1346,6 +1467,519 @@ class Analyzer:
             self.pulse * 0.82 ** (dt * 60), min(1.0, hit * 5)
         )
         return self.vals
+
+
+# ------------------------------------------------------------ audio DSP --
+# Genuine audible processing via a temporary virtual sink.
+#
+# Routing when enabled:
+#   playback apps -> artcava_dsp (virtual sink, default) -> parec monitor
+#   -> DSP worker (this file, --dsp-worker) -> paplay -> original sink -> speakers
+#   visualizer taps original sink monitor, so it sees processed audio.
+#
+# When disabled / on exit the reverse happens: pipeline stopped, streams
+# moved back to the original sink, original default restored, virtual sink
+# unloaded. Nothing is written to permanent PipeWire/PulseAudio config.
+#
+# The worker itself is pure numpy (already a dependency): FFT EQ with
+# Hann-window overlap-add (4096 FFT / 2048 hop at 48 kHz), stereo-linked
+# gains, and a soft-knee limiter so +12 dB boosts and 150% volume cannot
+# hard-clip. It polls settings.json so Settings > Audio changes apply live
+# without restarting the pipeline or the visualizer.
+
+def compute_eq_gains(params, rate=AUDIO_DSP_RATE, fft_size=AUDIO_DSP_FFT_SIZE):
+    """Linear FFT gains for one block, from audio_* settings.
+
+    Bass is a lowshelf (full below 200 Hz, gone by 800 Hz), treble a
+    highshelf (in from 2 kHz, full above 8 kHz), midrange and each EQ
+    band are Gaussian peaks in log-frequency. DC is left at 0 dB.
+    Master volume (0-150%) is applied as a flat linear gain.
+    """
+    freqs = np.fft.rfftfreq(fft_size, 1.0 / rate)
+    safe = np.maximum(freqs, 1.0)
+    logf = np.log2(safe)
+    db = np.zeros_like(freqs, dtype=np.float64)
+
+    bass_db = float(params.get("audio_bass", 0.0) or 0.0)
+    if bass_db:
+        lo, hi = math.log2(200.0), math.log2(800.0)
+        t = np.clip((logf - lo) / (hi - lo), 0.0, 1.0)
+        db += bass_db * (0.5 + 0.5 * np.cos(np.pi * t))
+
+    treble_db = float(params.get("audio_treble", 0.0) or 0.0)
+    if treble_db:
+        lo, hi = math.log2(2000.0), math.log2(8000.0)
+        t = np.clip((logf - lo) / (hi - lo), 0.0, 1.0)
+        db += treble_db * (0.5 - 0.5 * np.cos(np.pi * t))
+
+    mid_db = float(params.get("audio_mid", 0.0) or 0.0)
+    if mid_db:
+        db += mid_db * np.exp(-0.5 * ((logf - math.log2(1000.0)) / 0.7) ** 2)
+
+    for key, center, _label in AUDIO_EQ_BANDS:
+        gain_db = float(params.get(key, 0.0) or 0.0)
+        if gain_db:
+            db += gain_db * np.exp(-0.5 * ((logf - math.log2(center)) / 0.6) ** 2)
+
+    db[0] = 0.0
+    linear = 10.0 ** (db / 20.0)
+    volume = float(params.get("audio_volume", 100) or 0)
+    linear *= max(0.0, volume / 100.0)
+    return linear.astype(np.float64)
+
+
+def soft_clip(x, threshold=0.85, ceiling=0.98):
+    """Soft-knee limiter: linear below threshold, asymptotically ceiling above.
+
+    Prevents hard clipping/distortion when EQ boosts and volume are
+    combined, while leaving normal-level material untouched.
+    """
+    ax = np.abs(x)
+    denom = ceiling - threshold
+    return np.where(
+        ax <= threshold,
+        x,
+        np.sign(x) * (threshold + denom * (1.0 - np.exp(-(ax - threshold) / denom))),
+    )
+
+
+class DSPProcessor:
+    """Streaming stereo FFT EQ with overlap-add. Pure numpy, no scipy needed."""
+
+    def __init__(self, params=None, rate=AUDIO_DSP_RATE,
+                 fft_size=AUDIO_DSP_FFT_SIZE, hop=AUDIO_DSP_HOP):
+        self.rate = rate
+        self.fft_size = fft_size
+        self.hop = hop
+        self.params = dict(params or {})
+        self.gains = compute_eq_gains(self.params, rate, fft_size)
+        # Hann analysis window; 50% overlap-add of Hann sums to 1.0, so a
+        # flat EQ reconstructs the input at unity gain (verified by tests).
+        self.window = np.hanning(fft_size).astype(np.float64)
+        self.ola = np.zeros((fft_size, AUDIO_DSP_CHANNELS), dtype=np.float64)
+        self.input_buffer = np.zeros((0, AUDIO_DSP_CHANNELS), dtype=np.float64)
+        # Frame counters so flush() can drain exactly the input length
+        # (no infinite padding loop, no extra tail beyond the input).
+        self.total_in = 0
+        self.total_out = 0
+
+    def update_params(self, params):
+        new_gains = compute_eq_gains(params, self.rate, self.fft_size)
+        if not np.allclose(new_gains, self.gains):
+            self.gains = new_gains
+            self.params = dict(params)
+            return True
+        return False
+
+    def _process_one_block(self):
+        """Process one FFT block from input_buffer; return one hop of output."""
+        block = self.input_buffer[:self.fft_size] * self.window[:, None]
+        spectrum = np.fft.rfft(block, axis=0)
+        spectrum *= self.gains[:, None]
+        filtered = np.fft.irfft(spectrum, n=self.fft_size, axis=0)
+        self.ola += filtered
+        out = self.ola[:self.hop].copy()
+        # Shift OLA left by one hop; zero the tail for the next block.
+        self.ola = np.concatenate(
+            (self.ola[self.hop:], np.zeros((self.hop, AUDIO_DSP_CHANNELS))), axis=0
+        )
+        self.input_buffer = self.input_buffer[self.hop:]
+        self.total_out += self.hop
+        return out
+
+    def process(self, samples):
+        """Feed (n, 2) float samples; return newly available output (may be empty)."""
+        if samples is not None and len(samples):
+            samples = np.asarray(samples, dtype=np.float64)
+            if samples.ndim == 1:
+                samples = samples.reshape(-1, AUDIO_DSP_CHANNELS)
+            self.total_in += len(samples)
+            self.input_buffer = np.concatenate((self.input_buffer, samples), axis=0)
+        out_chunks = []
+        while len(self.input_buffer) >= self.fft_size:
+            out_chunks.append(self._process_one_block())
+        if not out_chunks:
+            return np.zeros((0, AUDIO_DSP_CHANNELS), dtype=np.float64)
+        return soft_clip(np.concatenate(out_chunks, axis=0))
+
+    def flush(self):
+        """Drain remaining buffered audio; total output == total input. Call at EOF."""
+        remaining = self.total_in - self.total_out
+        if remaining <= 0:
+            return np.zeros((0, AUDIO_DSP_CHANNELS), dtype=np.float64)
+        out_chunks = []
+        # Pad the final partial block once, then process until the input
+        # length has been produced. Padded zeros beyond the input are
+        # trimmed below, so this always terminates.
+        if len(self.input_buffer) < self.fft_size:
+            pad = self.fft_size - len(self.input_buffer)
+            self.input_buffer = np.concatenate(
+                (self.input_buffer, np.zeros((pad, AUDIO_DSP_CHANNELS))), axis=0
+            )
+        while self.total_out < self.total_in:
+            if len(self.input_buffer) < self.fft_size:
+                pad = self.fft_size - len(self.input_buffer)
+                self.input_buffer = np.concatenate(
+                    (self.input_buffer, np.zeros((pad, AUDIO_DSP_CHANNELS))), axis=0
+                )
+            out_chunks.append(self._process_one_block())
+        if not out_chunks:
+            return np.zeros((0, AUDIO_DSP_CHANNELS), dtype=np.float64)
+        out = soft_clip(np.concatenate(out_chunks, axis=0))
+        # Trim any output produced from zero-padding beyond the input length.
+        excess = len(out) - remaining
+        if excess > 0:
+            out = out[:remaining]
+        return out
+
+
+def read_dsp_params():
+    """Read audio_* values from settings.json (worker polls this for live updates)."""
+    params = {k: DEFAULTS[k] for k in DEFAULTS if k.startswith("audio_")}
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            for key in params:
+                if key in saved:
+                    params[key] = saved[key]
+    except (OSError, ValueError):
+        pass
+    return params
+
+
+def dsp_worker_main():
+    """Stdin/stdout s16le stereo worker: parec monitor in, processed PCM out."""
+    rate = AUDIO_DSP_RATE
+    argv = sys.argv[1:]
+    for i, arg in enumerate(argv):
+        if arg == "--rate" and i + 1 < len(argv):
+            try:
+                rate = int(argv[i + 1])
+            except ValueError:
+                pass
+    processor = DSPProcessor(params=read_dsp_params(), rate=rate)
+    try:
+        last_mtime = os.path.getmtime(CONFIG_FILE)
+    except OSError:
+        last_mtime = 0.0
+    hop_bytes = AUDIO_DSP_HOP * AUDIO_DSP_CHANNELS * 2
+    stdin = sys.stdin.buffer
+    stdout = sys.stdout.buffer
+    try:
+        while True:
+            # Live-update EQ/volume from settings.json without a restart.
+            try:
+                mtime = os.path.getmtime(CONFIG_FILE)
+            except OSError:
+                mtime = 0.0
+            if mtime != last_mtime:
+                last_mtime = mtime
+                processor.update_params(read_dsp_params())
+            data = stdin.read(hop_bytes)
+            if not data:
+                break
+            if len(data) % 2:
+                data = data[:-1]
+            samples = np.frombuffer(data, dtype=np.int16).astype(np.float64) / 32768.0
+            samples = samples.reshape(-1, AUDIO_DSP_CHANNELS)
+            out = processor.process(samples)
+            if len(out):
+                pcm = np.clip(out, -1.0, 1.0)
+                stdout.write((pcm * 32767.0).astype(np.int16).tobytes())
+                stdout.flush()
+        tail = processor.flush()
+        if len(tail):
+            pcm = np.clip(tail, -1.0, 1.0)
+            stdout.write((pcm * 32767.0).astype(np.int16).tobytes())
+            stdout.flush()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+    finally:
+        try:
+            stdout.flush()
+        except Exception:
+            pass
+
+
+def _run_pactl(args, timeout=3):
+    """Run pactl; return (returncode, stdout, stderr). Never raises."""
+    try:
+        result = subprocess.run(
+            ["pactl", *args], capture_output=True, text=True, timeout=timeout
+        )
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+    except FileNotFoundError:
+        return 127, "", "pactl not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", "pactl timeout"
+    except OSError as exc:
+        return 1, "", str(exc)
+
+
+def _pactl_default_sink():
+    rc, out, _err = _run_pactl(["get-default-sink"])
+    if rc == 0 and out:
+        return out.splitlines()[0].strip()
+    rc, out, _err = _run_pactl(["info"])
+    if rc == 0:
+        for line in out.splitlines():
+            if line.startswith("Default Sink:"):
+                return line.split(":", 1)[1].strip()
+    return None
+
+
+def _pactl_sink_exists(name):
+    rc, out, _err = _run_pactl(["list", "short", "sinks"])
+    if rc != 0:
+        return False
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[1].strip() == name:
+            return True
+    return False
+
+
+def _pactl_sink_input_ids():
+    rc, out, _err = _run_pactl(["list", "short", "sink-inputs"])
+    ids = []
+    if rc != 0:
+        return ids
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if parts and parts[0].strip().isdigit():
+            ids.append(parts[0].strip())
+    return ids
+
+
+class AudioDSPManager:
+    """Owns the virtual-sink routing and the parec->worker->paplay pipeline.
+
+    start() is idempotent; stop() always attempts to restore the original
+    sink/default even if individual steps fail. All failures are reported
+    via last_error and leave the visualizer running without DSP.
+    """
+
+    def __init__(self):
+        self.active = False
+        self.original_sink = None
+        self.module_index = None
+        self.parec_proc = None
+        self.worker_proc = None
+        self.paplay_proc = None
+        self.monitor_thread = None
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        self.last_error = ""
+        self.status = "off"
+
+    def is_active(self):
+        return self.active
+
+    def expected_monitor(self):
+        """Monitor the visualizer should tap: processed output when DSP is on."""
+        if self.active and self.original_sink:
+            return f"{self.original_sink}.monitor"
+        return "@DEFAULT_MONITOR@"
+
+    def _start_pipeline(self, original_sink):
+        parec_cmd = ["parec", f"--device={AUDIO_DSP_SINK_NAME}.monitor",
+                     "--format=s16le", f"--rate={AUDIO_DSP_RATE}",
+                     f"--channels={AUDIO_DSP_CHANNELS}", "--latency-msec=20"]
+        worker_cmd = [sys.executable, os.path.realpath(__file__), "--dsp-worker",
+                      "--rate", str(AUDIO_DSP_RATE)]
+        paplay_cmd = ["paplay", f"--device={original_sink}",
+                      "--format=s16le", f"--rate={AUDIO_DSP_RATE}",
+                      f"--channels={AUDIO_DSP_CHANNELS}", "--latency-msec=20"]
+        try:
+            parec = subprocess.Popen(parec_cmd, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, bufsize=0)
+            worker = subprocess.Popen(worker_cmd, stdin=parec.stdout,
+                                      stdout=subprocess.PIPE,
+                                      stderr=subprocess.DEVNULL, bufsize=0)
+            try:
+                parec.stdout.close()
+            except Exception:
+                pass
+            paplay = subprocess.Popen(paplay_cmd, stdin=worker.stdout,
+                                      stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL, bufsize=0)
+            try:
+                worker.stdout.close()
+            except Exception:
+                pass
+        except OSError as exc:
+            self.last_error = f"could not start DSP pipeline: {exc}"
+            return False
+        time.sleep(0.25)
+        for proc, name in ((parec, "parec"), (worker, "DSP worker"), (paplay, "paplay")):
+            if proc.poll() is not None:
+                self.last_error = f"DSP pipeline failed: {name} exited immediately"
+                for p in (paplay, worker, parec):
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+                return False
+        self.parec_proc, self.worker_proc, self.paplay_proc = parec, worker, paplay
+        return True
+
+    def _stop_pipeline(self):
+        for proc in (self.paplay_proc, self.worker_proc, self.parec_proc):
+            if proc is None:
+                continue
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
+        for proc in (self.paplay_proc, self.worker_proc, self.parec_proc):
+            if proc is None:
+                continue
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self.parec_proc = self.worker_proc = self.paplay_proc = None
+
+    def _monitor_loop(self):
+        while not self.stop_event.wait(1.0):
+            if not self.active:
+                break
+            for proc, name in ((self.parec_proc, "parec"), (self.worker_proc, "DSP worker"),
+                               (self.paplay_proc, "paplay")):
+                if proc is not None and proc.poll() is not None:
+                    self.last_error = f"DSP pipeline stopped unexpectedly ({name} exited)"
+                    self.status = "error"
+                    # Restore routing from this thread; stop() skips joining itself.
+                    self.stop()
+                    return
+
+    def start(self):
+        with self.lock:
+            if self.active:
+                return True
+            self.last_error = ""
+            self.status = "starting"
+            for tool in ("pactl", "parec", "paplay"):
+                if shutil.which(tool) is None:
+                    self.last_error = (
+                        f"{tool} not found - install pulseaudio-utils "
+                        "(or PipeWire's pipewire-pulse)"
+                    )
+                    self.status = "error"
+                    return False
+            original = _pactl_default_sink()
+            if not original:
+                self.last_error = "could not determine default sink (is PipeWire/PulseAudio running?)"
+                self.status = "error"
+                return False
+            if original == AUDIO_DSP_SINK_NAME:
+                self.last_error = "default sink is already ArtcavaDSP (stale state?)"
+                self.status = "error"
+                return False
+            self.original_sink = original
+
+            rc, out, err = _run_pactl([
+                "load-module", "module-null-sink",
+                f"sink_name={AUDIO_DSP_SINK_NAME}",
+                "sink_properties=device.description=ArtcavaDSP",
+                f"rate={AUDIO_DSP_RATE}", f"channels={AUDIO_DSP_CHANNELS}",
+            ])
+            if rc != 0:
+                self.last_error = f"could not create virtual sink: {err or out or 'pactl failed'}"
+                self.status = "error"
+                self.original_sink = None
+                return False
+            try:
+                self.module_index = out.splitlines()[0].strip() if out else None
+            except Exception:
+                self.module_index = None
+
+            # Wait briefly for the virtual sink to appear.
+            for _ in range(10):
+                if _pactl_sink_exists(AUDIO_DSP_SINK_NAME):
+                    break
+                time.sleep(0.2)
+            else:
+                self.last_error = "virtual sink did not appear after creation"
+                self._unload_virtual_sink()
+                self.status = "error"
+                self.original_sink = None
+                return False
+
+            rc, _out, err = _run_pactl(["set-default-sink", AUDIO_DSP_SINK_NAME])
+            if rc != 0:
+                self.last_error = f"could not set default sink: {err or 'pactl failed'}"
+                self._unload_virtual_sink()
+                self.status = "error"
+                self.original_sink = None
+                return False
+
+            # Move streams that existed before DSP started. paplay has not
+            # started yet, so there is no DSP output stream to exclude and
+            # no feedback loop is possible at this point.
+            for input_id in _pactl_sink_input_ids():
+                _run_pactl(["move-sink-input", input_id, AUDIO_DSP_SINK_NAME], timeout=2)
+
+            if not self._start_pipeline(original):
+                # Roll back routing so the user still hears normal audio.
+                for input_id in _pactl_sink_input_ids():
+                    _run_pactl(["move-sink-input", input_id, original], timeout=2)
+                _run_pactl(["set-default-sink", original], timeout=2)
+                self._unload_virtual_sink()
+                self.status = "error"
+                self.original_sink = None
+                return False
+
+            self.active = True
+            self.status = "active"
+            self.stop_event.clear()
+            self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+            self.monitor_thread.start()
+            return True
+
+    def _unload_virtual_sink(self):
+        if self.module_index:
+            _run_pactl(["unload-module", str(self.module_index)], timeout=2)
+            self.module_index = None
+        elif _pactl_sink_exists(AUDIO_DSP_SINK_NAME):
+            # Fallback: unload by module name (PulseAudio accepts this).
+            _run_pactl(["unload-module", "module-null-sink"], timeout=2)
+
+    def stop(self):
+        with self.lock:
+            was_active = self.active or self.module_index is not None
+            self.stop_event.set()
+            if self.monitor_thread is not None and threading.current_thread() is not self.monitor_thread:
+                self.monitor_thread.join(timeout=2)
+            self.monitor_thread = None
+            self._stop_pipeline()
+            original = self.original_sink
+            if was_active and original:
+                # Pipeline is stopped first, so moving streams back cannot loop.
+                if _pactl_sink_exists(original):
+                    for input_id in _pactl_sink_input_ids():
+                        _run_pactl(["move-sink-input", input_id, original], timeout=2)
+                    _run_pactl(["set-default-sink", original], timeout=2)
+                else:
+                    # Original device vanished (e.g. unplugged): fall back to
+                    # the first remaining non-virtual sink as default.
+                    rc, out, _err = _run_pactl(["list", "short", "sinks"])
+                    if rc == 0:
+                        for line in out.splitlines():
+                            parts = line.split("\t")
+                            if len(parts) >= 2 and parts[1].strip() != AUDIO_DSP_SINK_NAME:
+                                _run_pactl(["set-default-sink", parts[1].strip()], timeout=2)
+                                break
+                self._unload_virtual_sink()
+            self.active = False
+            if self.status != "error":
+                self.status = "off"
+            self.original_sink = None
 
 
 # ---------------------------------------------------------------- lyrics --
@@ -2127,6 +2761,12 @@ def status_line(watcher):
 
 # ------------------------------------------------------------------- main --
 def main():
+    # DSP worker mode: stdin/stdout PCM, no terminal required. Checked before
+    # the tty guard so the pipeline can run headless.
+    if "--dsp-worker" in sys.argv:
+        dsp_worker_main()
+        return
+
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         sys.exit(
             "Artcava needs a real terminal (not an IDE console). "
@@ -2137,6 +2777,15 @@ def main():
     decoration_renderer = DecorationRenderer()
     original_opacity = kitty_configured_opacity()
     in_kitty = kitty_available()
+
+    # Audio DSP: start before the visualizer so the first frames already
+    # tap processed audio. Failure here never blocks the visualizer.
+    audio_dsp = AudioDSPManager()
+    if SETTINGS.get("audio_enabled"):
+        if not audio_dsp.start():
+            SETTINGS["audio_enabled"] = False
+            save_settings()
+            print(f"Artcava: Audio DSP disabled: {audio_dsp.last_error}", file=sys.stderr)
 
     # Check GitHub in the background. This never blocks startup or playback.
     update_checker = UpdateChecker(os.path.realpath(__file__))
@@ -2154,10 +2803,12 @@ def main():
     lyrics.start()
 
     try:
-        reader = AudioReader()
+        reader = AudioReader(monitor=audio_dsp.expected_monitor())
     except FileNotFoundError:
+        audio_dsp.stop()
         sys.exit("parec not found - install pulseaudio-utils (works with PipeWire too).")
     except OSError as exc:
+        audio_dsp.stop()
         sys.exit(f"Could not start audio capture: {exc}")
     reader.start()
 
@@ -2235,7 +2886,20 @@ def main():
                 if key in ("s", "S"):
                     seekbar.cancel(lyrics)
                     settings_menu(update_checker, update_ui_state, decoration_renderer,
-                                  accent=accent, palette=watcher.palette)
+                                  accent=accent, palette=watcher.palette, audio_dsp=audio_dsp)
+                    # DSP may have been toggled in Settings: re-tap the correct
+                    # monitor so the visualizer follows processed/unprocessed audio.
+                    expected = audio_dsp.expected_monitor()
+                    if reader.monitor != expected:
+                        try:
+                            reader.proc.terminate()
+                        except Exception:
+                            pass
+                        try:
+                            reader = AudioReader(monitor=expected)
+                            reader.start()
+                        except OSError:
+                            pass
                     decoration_renderer.invalidate()
                     size = None
                     next_t = last = time.perf_counter()
@@ -2334,6 +2998,11 @@ def main():
     finally:
         try:
             reader.proc.terminate()
+        except Exception:
+            pass
+        # Restore original audio routing before leaving the alternate screen.
+        try:
+            audio_dsp.stop()
         except Exception:
             pass
         save_settings()
